@@ -228,19 +228,69 @@ ENTITY_COLORS = {
 
 
 def highlight_entities(text: str, entity_df: pd.DataFrame) -> str:
-    highlighted = text
+    """
+    Highlight entities in text using span-based, non-overlapping replacement.
+    Finds all entity occurrences as character-level spans, sorts them, resolves
+    overlaps (longest match wins), then rebuilds the string — so no entity label
+    ever bleeds into surrounding text.
+    """
+    if not text:
+        return text
+
     entity_df = entity_df.copy()
-    entity_df["_len"] = entity_df["Entity"].astype(str).str.len()
-    entity_df = entity_df.sort_values("_len", ascending=False)
+    entity_df["Entity"] = entity_df["Entity"].astype(str)
+    entity_df["Label"]  = entity_df["Label"].astype(str).str.upper()
+
+    # Build list of (start, end, entity_text, label, color)
+    spans = []
     for _, row in entity_df.iterrows():
-        entity = str(row["Entity"])
-        label  = str(row["Label"]).upper()
+        entity = row["Entity"].strip()
+        label  = row["Label"]
         color  = ENTITY_COLORS.get(label, "#ffff99")
-        highlighted = highlighted.replace(
-            entity,
-            f"<span style='background-color:{color};padding:2px 4px;"
-            f"border-radius:3px;'>{entity} <sup><b>{label}</b></sup></span>"
+        if not entity:
+            continue
+        # Case-insensitive search for all occurrences
+        pattern = re.compile(re.escape(entity), re.IGNORECASE)
+        for m in pattern.finditer(text):
+            spans.append((m.start(), m.end(), m.group(), label, color))
+
+    if not spans:
+        return text
+
+    # Sort by start position; for ties prefer longer span (greedy)
+    spans.sort(key=lambda s: (s[0], -(s[1] - s[0])))
+
+    # Remove overlapping spans — keep first (longest at each position)
+    filtered = []
+    last_end = -1
+    for span in spans:
+        start, end, matched_text, label, color = span
+        if start >= last_end:
+            filtered.append(span)
+            last_end = end
+
+    # Reconstruct the text with HTML highlights
+    result = []
+    cursor = 0
+    for start, end, matched_text, label, color in filtered:
+        # Append plain text before this span
+        result.append(text[cursor:start])
+        # Append highlighted span
+        result.append(
+            f"<span style='background-color:{color};"
+            f"padding:2px 5px;border-radius:4px;font-weight:500;'>"
+            f"{matched_text}"
+            f"<sup style='font-size:0.65em;font-weight:700;margin-left:2px;"
+            f"color:#333;'>{label}</sup></span>"
         )
+        cursor = end
+
+    # Append any remaining plain text
+    result.append(text[cursor:])
+
+    # Preserve line breaks for readability
+    highlighted = "".join(result)
+    highlighted = highlighted.replace("\n", "<br>")
     return highlighted
 
 
@@ -437,14 +487,39 @@ with tab2:
         text    = ocr_txt_file.read().decode("utf-8")
         auto_df = pd.read_excel(auto_ner_file) if auto_ner_file.name.endswith(".xlsx") else pd.read_csv(auto_ner_file)
 
-        st.markdown("""
-### Legend
-🟢 HERB &nbsp; 🔴 DISEASE &nbsp; 🟠 BODY_PART &nbsp; 🔵 PROCEDURE &nbsp;
-🟣 BIOLOGICAL_PROCESS &nbsp; 🟡 SYMPTOM &nbsp; 🟦 CHEMICAL &nbsp; ⚪ PROTEIN
-""")
+        # Legend with color swatches
+        st.markdown("### Legend")
+        legend_cols = st.columns(len(ENTITY_COLORS))
+        for col, (label, color) in zip(legend_cols, ENTITY_COLORS.items()):
+            col.markdown(
+                f"<span style='background-color:{color};padding:3px 8px;"
+                f"border-radius:4px;font-size:0.8em;font-weight:600;'>{label}</span>",
+                unsafe_allow_html=True,
+            )
+
         if "Entity" in auto_df.columns and "Label" in auto_df.columns:
             st.subheader("Highlighted Entities")
-            st.markdown(highlight_entities(text, auto_df), unsafe_allow_html=True)
+            highlighted_html = highlight_entities(text, auto_df)
+            # Wrap in a styled container for clean rendering
+            st.markdown(
+                f"""
+                <div style="
+                    background-color: #0e1117;
+                    color: #fafafa;
+                    padding: 20px 24px;
+                    border-radius: 8px;
+                    border: 1px solid #333;
+                    line-height: 1.9;
+                    font-size: 0.95rem;
+                    font-family: 'Source Sans Pro', sans-serif;
+                    white-space: pre-wrap;
+                    word-wrap: break-word;
+                ">
+                {highlighted_html}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
         else:
             st.warning("Automated file must have columns: Entity, Label")
 
@@ -709,7 +784,7 @@ with tab4:
 1. Open **Neo4j Browser** at `http://localhost:7474`
 2. Log in with your credentials
 3. Click the file icon (top left) → paste the contents of the `.cypher` file
-4. Press **Run** (▶)
+4. Press **Run** (▶️)
 5. Then run this query to see your graph:
 ```cypher
 MATCH (n)-[r]->(m) RETURN n, r, m
