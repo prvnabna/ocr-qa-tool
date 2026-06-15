@@ -3,3 +3,4 @@ pandas
 jiwer
 pymupdf
 python-docx
+openpyxl
