@@ -4,3 +4,5 @@ jiwer
 pymupdf
 python-docx
 openpyxl
+neo4j
+pyvis
