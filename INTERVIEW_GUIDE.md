@@ -1,4 +1,4 @@
-# Interview Guide: MedYukthee QA Validation Tool
+# Interview Guide: QA Validation Tool
 
 **Purpose**: Structured Q&A to explain your project to professors, mentors, recruiters, and internship reviewers.
 

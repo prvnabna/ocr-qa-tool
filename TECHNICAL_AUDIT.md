@@ -1,4 +1,4 @@
-# MedYukthee QA Validation Tool — Technical Audit
+# QA Validation Tool — Technical Audit
 
 **Document Purpose**: Comprehensive technical architecture and code quality assessment for academic, professional, and internship review contexts.
 
@@ -11,7 +11,7 @@
 ## 1. Executive Summary
 
 ### What the Project Does
-The **MedYukthee QA Validation Tool** is a Streamlit-based web application that:
+The **QA Validation Tool** is a Streamlit-based web application that:
 - Validates OCR (Optical Character Recognition) output quality by comparing OCR-generated text against ground-truth PDF originals
 - Provides Named Entity Recognition (NER) entity highlighting and distribution analysis for medical domain entities
 - Converts relational CSV data into Neo4j Cypher export format for knowledge graph construction
@@ -660,8 +660,8 @@ CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0
 
 Build and run:
 ```bash
-docker build -t medyukthee-qa .
-docker run -p 8501:8501 medyukthee-qa
+docker build -t qa-validation-tool .
+docker run -p 8501:8501 qa-validation-tool
 ```
 
 ### Cloud Deployment Options
@@ -971,7 +971,7 @@ For public SaaS, would need 4-6 more weeks (FastAPI migration, multi-tenancy, mo
 
 ## 16. Conclusion
 
-The **MedYukthee QA Validation Tool** is a **well-architected alpha-stage project** suitable for **research, prototyping, and internal QA workflows**. It implements a **correct, industry-standard OCR evaluation pipeline** with clean code and intuitive UI.
+The **QA Validation Tool** is a **well-architected alpha-stage project** suitable for **research, prototyping, and internal QA workflows**. It implements a **correct, industry-standard OCR evaluation pipeline** with clean code and intuitive UI.
 
 **For Academic/Interview Context**:
 - Demonstrates understanding of OCR pipelines, normalization, and WER

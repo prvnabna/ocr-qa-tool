@@ -9,11 +9,26 @@ import re
 from typing import Tuple, List
 from io import BytesIO
 import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
+from openpyxl.styles import Font, PatternFill, Alignment
+import tempfile
+import os
+
+# Neo4j — only imported if available
+try:
+    from neo4j import GraphDatabase
+    NEO4J_AVAILABLE = True
+except ImportError:
+    NEO4J_AVAILABLE = False
+
+# PyVis — for graph visualization
+try:
+    from pyvis.network import Network
+    PYVIS_AVAILABLE = True
+except ImportError:
+    PYVIS_AVAILABLE = False
 
 # ==================================================
-# Extraction helpers
+# ABNA — Extraction helpers (QA-01)
 # ==================================================
 
 def extract_pdf_text(pdf_file) -> str:
@@ -34,10 +49,6 @@ def extract_docx_text(docx_file) -> str:
     return page_separator.join(paragraphs)
 
 
-# ==================================================
-# Normalization
-# ==================================================
-
 def normalize_text(text: str) -> str:
     if text is None:
         return ""
@@ -45,7 +56,6 @@ def normalize_text(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = text.replace("\f", "\n\f\n")
     text = re.sub(r"\n[ \t]*\f[ \t]*\n", "\n<PAGE>\n", text)
-
     metadata_patterns = [
         r"^\s*(ocr output)\b.*$",
         r"^\s*(ocr:)\b.*$",
@@ -57,7 +67,6 @@ def normalize_text(text: str) -> str:
         r"^\s*[-=]{3,}\s*$",
         r"^\s*text extracted by\b.*$",
     ]
-
     lines = text.split("\n")
     filtered_lines = []
     for line in lines:
@@ -65,10 +74,9 @@ def normalize_text(text: str) -> str:
         if not stripped:
             filtered_lines.append("")
             continue
-        is_metadata = any(re.match(pat, stripped, flags=re.IGNORECASE) for pat in metadata_patterns)
+        is_metadata = any(re.match(p, stripped, flags=re.IGNORECASE) for p in metadata_patterns)
         if not is_metadata:
             filtered_lines.append(line)
-
     text = "\n".join(filtered_lines)
     text = re.sub(r"\n{3,}", "\n\n", text)
     paragraphs = [p.strip() for p in text.split("\n\n")]
@@ -77,10 +85,6 @@ def normalize_text(text: str) -> str:
     text = text.lower().strip()
     return text
 
-
-# ==================================================
-# Accuracy calculation
-# ==================================================
 
 def calculate_ocr_accuracy(ground_truth: str, ocr_text: str) -> Tuple[float, float]:
     ground_truth = "" if ground_truth is None else str(ground_truth)
@@ -93,668 +97,607 @@ def calculate_ocr_accuracy(ground_truth: str, ocr_text: str) -> Tuple[float, flo
 
 
 def generate_word_comparison(gt_words: List[str], ocr_words: List[str]) -> pd.DataFrame:
-    diff = list(difflib.ndiff(gt_words, ocr_words))
-    comparison_data = []
-    i = 0
-    tokens = list(diff)
-    while i < len(tokens):
-        token = tokens[i]
-        if token.startswith("  "):
-            word = token[2:]
-            comparison_data.append({
-                "Ground Truth": word,
-                "OCR Output": word,
-                "Status": "Match"
-            })
-            i += 1
-        elif token.startswith("- "):
-            gt_word = token[2:]
-            # Check if next token is an insertion → substitution
-            if i + 1 < len(tokens) and tokens[i + 1].startswith("+ "):
-                ocr_word = tokens[i + 1][2:]
-                comparison_data.append({
-                    "Ground Truth": gt_word,
-                    "OCR Output": ocr_word,
-                    "Status": "Substitution"
-                })
-                i += 2
-            else:
-                comparison_data.append({
-                    "Ground Truth": gt_word,
-                    "OCR Output": "[MISSING]",
-                    "Status": "Deletion"
-                })
-                i += 1
-        elif token.startswith("+ "):
-            comparison_data.append({
-                "Ground Truth": "[EXTRA]",
-                "OCR Output": token[2:],
-                "Status": "Insertion"
-            })
-            i += 1
-        else:
-            i += 1
-    return pd.DataFrame(comparison_data)
+    matcher = difflib.SequenceMatcher(None, gt_words, ocr_words)
+    rows = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for gt_w, ocr_w in zip(gt_words[i1:i2], ocr_words[j1:j2]):
+                rows.append({"Ground Truth": gt_w, "OCR Output": ocr_w, "Status": "Match"})
+        elif tag == "replace":
+            gt_chunk = gt_words[i1:i2]
+            ocr_chunk = ocr_words[j1:j2]
+            for k in range(max(len(gt_chunk), len(ocr_chunk))):
+                gt_w = gt_chunk[k] if k < len(gt_chunk) else ""
+                ocr_w = ocr_chunk[k] if k < len(ocr_chunk) else ""
+                rows.append({"Ground Truth": gt_w, "OCR Output": ocr_w, "Status": "Mismatch"})
+        elif tag == "delete":
+            for gt_w in gt_words[i1:i2]:
+                rows.append({"Ground Truth": gt_w, "OCR Output": "", "Status": "Deletion"})
+        elif tag == "insert":
+            for ocr_w in ocr_words[j1:j2]:
+                rows.append({"Ground Truth": "", "OCR Output": ocr_w, "Status": "Insertion"})
+    return pd.DataFrame(rows)
 
 
 def calculate_error_statistics(comparison_df: pd.DataFrame) -> dict:
     counts = comparison_df["Status"].value_counts().to_dict()
     return {
-        "Matches":       counts.get("Match", 0),
-        "Substitutions": counts.get("Substitution", 0),
-        "Insertions":    counts.get("Insertion", 0),
-        "Deletions":     counts.get("Deletion", 0),
+        "Matches":    counts.get("Match", 0),
+        "Mismatches": counts.get("Mismatch", 0),
+        "Insertions": counts.get("Insertion", 0),
+        "Deletions":  counts.get("Deletion", 0),
     }
 
 
-# ==================================================
-# Excel report builder — 2 sheets matching screenshot
-# ==================================================
-
-def _thin_border():
-    thin = Side(style="thin", color="CCCCCC")
-    return Border(left=thin, right=thin, top=thin, bottom=thin)
-
-
-def _apply_header_row(ws, row_num: int, header_fill_hex: str = "4472C4"):
-    fill = PatternFill("solid", start_color=header_fill_hex, end_color=header_fill_hex)
-    font = Font(bold=True, color="FFFFFF", name="Arial", size=10)
-    for cell in ws[row_num]:
-        cell.fill = fill
-        cell.font = font
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-        cell.border = _thin_border()
-
-
-def create_excel_report(
-    ground_truth: str,
-    ocr_text: str,
-    accuracy: float,
-    error_rate: float,
-    source_filename: str = "uploaded file",
-) -> bytes:
-    """
-    Produces a 2-sheet Excel workbook:
-
-    Sheet 1 — OCR Accuracy Report
-        Exactly matches the screenshot:
-        | Metric               | Value  |
-        | OCR Accuracy (%)     | 93.95  |
-        | Word Error Rate (%)  | 6.05   |
-        | Ground Truth Words   | 7023   |
-        | OCR Words            | 7221   |
-        Plus: Matches, Substitutions, Insertions, Deletions
-
-    Sheet 2 — Word Comparison
-        Exactly matches the screenshot second table:
-        | Ground Truth | OCR Output   |   Status     |
-        | word1        | word1        | Match        |
-        | word2        | word2        | Match        |
-        | word3        | wrong_word   | Substitution |
-        Color-coded rows (green = match, red = substitution, orange = deletion/insertion)
-    """
-    gt_norm  = normalize_text(ground_truth)
-    ocr_norm = normalize_text(ocr_text)
+def create_professional_excel_report(ground_truth, ocr_text, accuracy, error_rate) -> bytes:
+    gt_norm   = normalize_text(ground_truth)
+    ocr_norm  = normalize_text(ocr_text)
     gt_words  = gt_norm.split()
     ocr_words = ocr_norm.split()
-
     comparison_df = generate_word_comparison(gt_words, ocr_words)
     error_stats   = calculate_error_statistics(comparison_df)
 
-    output = BytesIO()
-    wb = openpyxl.Workbook()
+    output   = BytesIO()
+    wb       = openpyxl.Workbook()
+    BLUE_HDR = PatternFill("solid", fgColor="4472C4")
+    WHT_FONT = Font(bold=True, color="FFFFFF")
 
-    # ── SHEET 1: OCR Accuracy Report ──────────────────────────────────────────
+    def style_header(ws, cols):
+        for c in range(1, cols + 1):
+            cell = ws.cell(row=1, column=c)
+            cell.fill = BLUE_HDR
+            cell.font = WHT_FONT
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    # Sheet 1 — Summary
     ws1 = wb.active
-    ws1.title = "OCR Accuracy Report"
-
-    # Title row
-    ws1.merge_cells("A1:B1")
-    title_cell = ws1["A1"]
-    title_cell.value = "OCR ACCURACY REPORT"
-    title_cell.font = Font(bold=True, color="FFFFFF", name="Arial", size=13)
-    title_cell.fill = PatternFill("solid", start_color="1F3864", end_color="1F3864")
-    title_cell.alignment = Alignment(horizontal="center", vertical="center")
-    ws1.row_dimensions[1].height = 30
-
-    # Sub-title / source
-    ws1.merge_cells("A2:B2")
-    ws1["A2"].value = f"Source: {source_filename}"
-    ws1["A2"].font = Font(italic=True, color="555555", name="Arial", size=9)
-    ws1["A2"].alignment = Alignment(horizontal="center")
-    ws1.row_dimensions[2].height = 16
-
-    # Blank row
-    ws1.row_dimensions[3].height = 8
-
-    # Header row (row 4)
-    ws1["A4"] = "Metric"
-    ws1["B4"] = "Value"
-    _apply_header_row(ws1, 4)
-    ws1.row_dimensions[4].height = 22
-
-    # Data rows
-    total_errors = (
-        error_stats["Substitutions"]
-        + error_stats["Insertions"]
-        + error_stats["Deletions"]
-    )
-
-    metrics = [
+    ws1.title = "Summary"
+    rows = [
+        ("Metric", "Value"),
         ("OCR Accuracy (%)",    round(accuracy, 2)),
         ("Word Error Rate (%)", round(error_rate * 100, 2)),
         ("Ground Truth Words",  len(gt_words)),
         ("OCR Words",           len(ocr_words)),
         ("Total Matches",       error_stats["Matches"]),
-        ("Total Mismatches",    total_errors),
-        ("Substitutions",       error_stats["Substitutions"]),
-        ("Insertions",          error_stats["Insertions"]),
-        ("Deletions",           error_stats["Deletions"]),
+        ("Total Mismatches",    error_stats["Mismatches"]),
+        ("Total Insertions",    error_stats["Insertions"]),
+        ("Total Deletions",     error_stats["Deletions"]),
     ]
-
-    # Color map for each metric row
-    row_colors = {
-        "OCR Accuracy (%)":    ("E2EFDA", "375623"),   # green bg, dark green text
-        "Word Error Rate (%)": ("FCE4D6", "843C0C"),   # orange bg, dark orange text
-        "Ground Truth Words":  ("DDEEFF", "1F3864"),
-        "OCR Words":           ("DDEEFF", "1F3864"),
-        "Total Matches":       ("E2EFDA", "375623"),
-        "Total Mismatches":    ("FCE4D6", "843C0C"),
-        "Substitutions":       ("FFF2CC", "7F6000"),
-        "Insertions":          ("FCE4D6", "843C0C"),
-        "Deletions":           ("FCE4D6", "843C0C"),
-    }
-
-    for r_offset, (metric_name, metric_val) in enumerate(metrics):
-        excel_row = 5 + r_offset
-        bg, fg = row_colors.get(metric_name, ("FFFFFF", "000000"))
-
-        cell_a = ws1.cell(row=excel_row, column=1, value=metric_name)
-        cell_b = ws1.cell(row=excel_row, column=2, value=metric_val)
-
-        for cell in (cell_a, cell_b):
-            cell.fill = PatternFill("solid", start_color=bg, end_color=bg)
-            cell.font = Font(name="Arial", size=10, color=fg,
-                             bold=(metric_name in ("OCR Accuracy (%)", "Word Error Rate (%)")))
-            cell.border = _thin_border()
-            cell.alignment = Alignment(horizontal="center" if cell.column == 2 else "left",
-                                       vertical="center")
-        ws1.row_dimensions[excel_row].height = 20
-
-    # Column widths
+    for r, (m, v) in enumerate(rows, 1):
+        ws1.cell(r, 1, m)
+        ws1.cell(r, 2, v)
+    style_header(ws1, 2)
     ws1.column_dimensions["A"].width = 28
-    ws1.column_dimensions["B"].width = 18
+    ws1.column_dimensions["B"].width = 20
 
-    # ── SHEET 2: Word Comparison ───────────────────────────────────────────────
+    # Sheet 2 — Word Comparison
     ws2 = wb.create_sheet("Word Comparison")
+    for c, h in enumerate(["Ground Truth", "OCR Output", "Status"], 1):
+        ws2.cell(1, c, h)
+    style_header(ws2, 3)
+    GREEN = PatternFill("solid", fgColor="C6EFCE")
+    RED   = PatternFill("solid", fgColor="FFC7CE")
+    YEL   = PatternFill("solid", fgColor="FFEB9C")
+    ORG   = PatternFill("solid", fgColor="FFD966")
+    fill_map = {"Match": GREEN, "Mismatch": RED, "Deletion": YEL, "Insertion": ORG}
+    for i, row in comparison_df.iterrows():
+        r = i + 2
+        ws2.cell(r, 1, row["Ground Truth"])
+        ws2.cell(r, 2, row["OCR Output"])
+        ws2.cell(r, 3, row["Status"]).alignment = Alignment(horizontal="center")
+        fill = fill_map.get(row["Status"])
+        if fill:
+            for c in range(1, 4):
+                ws2.cell(r, c).fill = fill
+    ws2.column_dimensions["A"].width = 25
+    ws2.column_dimensions["B"].width = 25
+    ws2.column_dimensions["C"].width = 15
 
-    # Title
-    ws2.merge_cells("A1:C1")
-    ws2["A1"].value = "WORD COMPARISON — Ground Truth vs OCR Output"
-    ws2["A1"].font = Font(bold=True, color="FFFFFF", name="Arial", size=12)
-    ws2["A1"].fill = PatternFill("solid", start_color="1F3864", end_color="1F3864")
-    ws2["A1"].alignment = Alignment(horizontal="center", vertical="center")
-    ws2.row_dimensions[1].height = 28
-
-    # Note row
-    ws2.merge_cells("A2:C2")
-    ws2["A2"].value = (
-        f"Showing all {len(comparison_df):,} word comparisons  |  "
-        f"Match = ✅ green  |  Substitution = 🔴 red  |  "
-        f"Deletion = 🟡 orange  |  Insertion = 🟠 salmon"
-    )
-    ws2["A2"].font = Font(italic=True, color="444444", name="Arial", size=9)
-    ws2["A2"].alignment = Alignment(horizontal="center")
-    ws2.row_dimensions[2].height = 16
-
-    # Blank
-    ws2.row_dimensions[3].height = 6
-
-    # Header
-    ws2["A4"] = "Ground Truth"
-    ws2["B4"] = "OCR Output"
-    ws2["C4"] = "Status"
-    _apply_header_row(ws2, 4)
-    ws2.row_dimensions[4].height = 22
-
-    # Status → fill colours
-    status_fill = {
-        "Match":        PatternFill("solid", start_color="C6EFCE", end_color="C6EFCE"),
-        "Substitution": PatternFill("solid", start_color="FFC7CE", end_color="FFC7CE"),
-        "Deletion":     PatternFill("solid", start_color="FFEB9C", end_color="FFEB9C"),
-        "Insertion":    PatternFill("solid", start_color="FCE4D6", end_color="FCE4D6"),
-    }
-    status_font_color = {
-        "Match":        "375623",
-        "Substitution": "9C0006",
-        "Deletion":     "7F6000",
-        "Insertion":    "843C0C",
-    }
-
-    for r_offset, (_, data_row) in enumerate(comparison_df.iterrows()):
-        excel_row = 5 + r_offset
-        status = data_row["Status"]
-
-        fill = status_fill.get(status, PatternFill("solid", start_color="FFFFFF", end_color="FFFFFF"))
-        fcolor = status_font_color.get(status, "000000")
-
-        for col_idx, col_key in enumerate(["Ground Truth", "OCR Output", "Status"], start=1):
-            cell = ws2.cell(row=excel_row, column=col_idx, value=data_row[col_key])
-            cell.fill = fill
-            cell.font = Font(name="Arial", size=9, color=fcolor)
-            cell.border = _thin_border()
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-        ws2.row_dimensions[excel_row].height = 16
-
-    # Freeze panes so header stays visible while scrolling
-    ws2.freeze_panes = "A5"
-
-    # Column widths
-    ws2.column_dimensions["A"].width = 30
-    ws2.column_dimensions["B"].width = 30
-    ws2.column_dimensions["C"].width = 18
-
-    output_bytes = output.getvalue()
     wb.save(output)
     return output.getvalue()
+
+
+def create_text_report(ground_truth, ocr_text, accuracy, error_rate) -> str:
+    gt_words  = normalize_text(ground_truth).split()
+    ocr_words = normalize_text(ocr_text).split()
+    stats = calculate_error_statistics(generate_word_comparison(gt_words, ocr_words))
+    return "\n".join([
+        "OCR ACCURACY REPORT", "=" * 40,
+        f"OCR Accuracy      : {accuracy:.2f}%",
+        f"Word Error Rate   : {error_rate * 100:.2f}%",
+        f"Ground Truth Words: {len(gt_words)}",
+        f"OCR Words         : {len(ocr_words)}", "",
+        "ERROR BREAKDOWN", "-" * 40,
+        f"Matches    : {stats['Matches']}",
+        f"Mismatches : {stats['Mismatches']}",
+        f"Insertions : {stats['Insertions']}",
+        f"Deletions  : {stats['Deletions']}",
+    ])
+
+
+# ==================================================
+# HARINI — NER helpers (QA-02)
+# ==================================================
+
+ENTITY_COLORS = {
+    "HERB":               "#90EE90",
+    "DISEASE":            "#FFB6B6",
+    "BODY_PART":          "#FFD580",
+    "PROCEDURE":          "#ADD8E6",
+    "BIOLOGICAL_PROCESS": "#D8BFD8",
+    "SYMPTOM":            "#FFF176",
+    "CHEMICAL":           "#A7FFEB",
+    "PROTEIN":            "#C5CAE9",
+    "DOSHA":              "#ddd5f7",
+    "COMPOUND":           "#fef3c7",
+}
+
+
+def highlight_entities(text: str, entity_df: pd.DataFrame) -> str:
+    """Highlight entities in text using colour spans."""
+    highlighted = text
+    # Sort by length descending so longer matches replace first
+    entity_df = entity_df.copy()
+    entity_df["_len"] = entity_df["Entity"].astype(str).str.len()
+    entity_df = entity_df.sort_values("_len", ascending=False)
+    for _, row in entity_df.iterrows():
+        entity = str(row["Entity"])
+        label  = str(row["Label"]).upper()
+        color  = ENTITY_COLORS.get(label, "#ffff99")
+        highlighted = highlighted.replace(
+            entity,
+            f"<span style='background-color:{color};padding:2px 4px;"
+            f"border-radius:3px;'>{entity} <sup><b>{label}</b></sup></span>"
+        )
+    return highlighted
+
+
+def compute_ner_metrics(auto_df: pd.DataFrame, manual_df: pd.DataFrame):
+    auto_entities   = set(auto_df["Entity"].dropna().astype(str).str.lower())
+    manual_entities = set(manual_df["Entity"].dropna().astype(str).str.lower())
+    matched = auto_entities & manual_entities
+    missing = manual_entities - auto_entities
+    extra   = auto_entities - manual_entities
+    precision = len(matched) / (len(matched) + len(extra))   if (len(matched) + len(extra))   > 0 else 0
+    recall    = len(matched) / (len(matched) + len(missing)) if (len(matched) + len(missing)) > 0 else 0
+    f1        = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+    return matched, missing, extra, precision, recall, f1
+
+
+# ==================================================
+# NEHA — Relationship / Neo4j helpers (QA-03 + DB-02)
+# ==================================================
+
+def validate_relationships(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove duplicates and add Status column — mirrors relationship_validation.py"""
+    df = df.drop_duplicates()
+    df = df.copy()
+    df["Status"] = "Correct"
+    return df
+
+
+def build_cypher(df: pd.DataFrame, source_col: str, relation_col: str, target_col: str) -> str:
+    """Generate Neo4j Cypher MERGE statements — mirrors neo4j_export.py"""
+    lines = []
+    for _, row in df.iterrows():
+        src = str(row[source_col]).replace("'", "\\'")
+        rel = str(row[relation_col]).upper().replace(" ", "_")
+        tgt = str(row[target_col]).replace("'", "\\'")
+        lines.append(
+            f"MERGE (a:Entity {{name:'{src}'}})\n"
+            f"MERGE (b:Entity {{name:'{tgt}'}})\n"
+            f"MERGE (a)-[:{rel}]->(b);"
+        )
+    return "\n\n".join(lines)
+
+
+# ==================================================
+# NEHA — Neo4j push + graph visualization helpers
+# ==================================================
+
+def push_to_neo4j(df: pd.DataFrame, src_col: str, rel_col: str, tgt_col: str,
+                  uri: str, user: str, password: str):
+    """Push all triples from dataframe into Neo4j Desktop."""
+    driver = GraphDatabase.driver(uri, auth=(user, password))
+    pushed = 0
+    with driver.session() as session:
+        # Clear old data first
+        session.run("MATCH (n) DETACH DELETE n")
+        for _, row in df.iterrows():
+            src = str(row[src_col]).strip()
+            rel = str(row[rel_col]).strip().upper().replace(" ", "_")
+            tgt = str(row[tgt_col]).strip()
+            session.run(
+                """
+                MERGE (a:Entity {name: $src})
+                MERGE (b:Entity {name: $tgt})
+                MERGE (a)-[r:REL {type: $rel}]->(b)
+                """,
+                src=src, tgt=tgt, rel=rel
+            )
+            pushed += 1
+    driver.close()
+    return pushed
+
+
+def draw_graph(df: pd.DataFrame, src_col: str, rel_col: str, tgt_col: str) -> str:
+    """Draw interactive graph using PyVis and return HTML string."""
+    net = Network(height="500px", width="100%", bgcolor="#1a1a2e", font_color="white",
+                  directed=True)
+    net.set_options("""
+    {
+      "nodes": {
+        "font": {"size": 14, "color": "white"},
+        "borderWidth": 2,
+        "shadow": true
+      },
+      "edges": {
+        "font": {"size": 11, "color": "#aaaaaa", "align": "middle"},
+        "arrows": {"to": {"enabled": true, "scaleFactor": 0.8}},
+        "smooth": {"type": "curvedCW", "roundness": 0.2},
+        "shadow": true
+      },
+      "physics": {
+        "forceAtlas2Based": {
+          "gravitationalConstant": -50,
+          "springLength": 120
+        },
+        "solver": "forceAtlas2Based"
+      }
+    }
+    """)
+
+    # Color map for node types (based on relation patterns)
+    node_colors = {}
+    added_nodes = set()
+
+    for _, row in df.iterrows():
+        src = str(row[src_col]).strip()
+        rel = str(row[rel_col]).strip().upper()
+        tgt = str(row[tgt_col]).strip()
+
+        # Assign colors based on which side of a relation
+        if src not in node_colors:
+            node_colors[src] = "#4CAF50"   # green for source (herb)
+        if tgt not in node_colors:
+            node_colors[tgt] = "#F44336"   # red for target (disease/dosha)
+
+        if src not in added_nodes:
+            net.add_node(src, label=src, color=node_colors[src], size=20)
+            added_nodes.add(src)
+        if tgt not in added_nodes:
+            net.add_node(tgt, label=tgt, color=node_colors[tgt], size=20)
+            added_nodes.add(tgt)
+
+        net.add_edge(src, tgt, label=rel, color="#888888")
+
+    # Save to temp file and return HTML
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".html")
+    net.save_graph(tmp.name)
+    with open(tmp.name, "r", encoding="utf-8") as f:
+        html = f.read()
+    os.unlink(tmp.name)
+    return html
 
 
 # ==================================================
 # Streamlit UI
 # ==================================================
 
-st.set_page_config(page_title="MedYukthee QA Tool", layout="wide")
-st.title("MedYukthee QA Validation Tool")
+st.set_page_config(page_title="QA Validation Tool", layout="wide")
+st.title("QA Validation Tool")
 
 tab1, tab2, tab3 = st.tabs([
-    "📄 OCR Accuracy (QA-01)",
+    "🔤 OCR Accuracy (QA-01)",
     "🏷️ NER Validator (QA-02)",
     "🔗 Relationship Reviewer (QA-03 + DB-02)",
 ])
 
-# ══════════════════════════════════════════════════════════════════
-# TAB 1 — OCR Accuracy (QA-01)
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════
+# TAB 1 — ABNA : OCR Accuracy (QA-01)
+# ══════════════════════════════════════════════════
 with tab1:
     st.subheader("OCR Accuracy Validation")
-    st.write("Upload the **Original PDF** and the **OCR output text file**. "
-             "The tool will generate two Excel report sheets.")
+    st.write("Upload the original PDF and the OCR-generated text file.")
 
-    col_up1, col_up2 = st.columns(2)
-    with col_up1:
-        original_pdf = st.file_uploader("📂 Upload Original PDF (Ground Truth)", type=["pdf"], key="pdf")
-    with col_up2:
-        ocr_file = st.file_uploader("📂 Upload OCR Output (.txt or .docx)", type=["txt", "docx"], key="ocr")
+    original_pdf = st.file_uploader("Upload Original PDF", type=["pdf"], key="pdf")
+    ocr_file_up  = st.file_uploader("Upload OCR Output",  type=["txt", "docx"], key="ocr")
 
-    if st.button("▶ Calculate Accuracy & Generate Reports", type="primary"):
-        if not original_pdf or not ocr_file:
-            st.warning("Please upload both files before calculating.")
+    if st.button("Calculate Accuracy"):
+        if not original_pdf or not ocr_file_up:
+            st.warning("Please upload both files.")
         else:
-            with st.spinner("Analysing OCR accuracy..."):
-                ground_truth = extract_pdf_text(original_pdf)
+            ground_truth = extract_pdf_text(original_pdf)
 
-                if ocr_file.name.lower().endswith(".txt"):
-                    raw = ocr_file.read()
-                    try:
-                        ocr_text = raw.decode("utf-8")
-                    except Exception:
-                        ocr_text = raw.decode("latin-1", errors="ignore")
-                elif ocr_file.name.lower().endswith(".docx"):
-                    ocr_text = extract_docx_text(ocr_file)
-                else:
-                    st.error("Unsupported OCR file format.")
-                    st.stop()
+            if ocr_file_up.name.lower().endswith(".txt"):
+                raw = ocr_file_up.read()
+                try:
+                    ocr_text = raw.decode("utf-8")
+                except Exception:
+                    ocr_text = raw.decode("latin-1", errors="ignore")
+            else:
+                ocr_text = extract_docx_text(ocr_file_up)
 
-                error_rate, accuracy = calculate_ocr_accuracy(ground_truth, ocr_text)
+            error_rate, accuracy = calculate_ocr_accuracy(ground_truth, ocr_text)
 
-                gt_norm   = normalize_text(ground_truth)
-                ocr_norm  = normalize_text(ocr_text)
-                gt_words  = gt_norm.split()
-                ocr_words = ocr_norm.split()
+            c1, c2 = st.columns(2)
+            c1.metric("Word Error Rate (WER)", f"{error_rate * 100:.2f}%")
+            c2.metric("OCR Accuracy",          f"{accuracy:.2f}%")
 
-                comparison_df = generate_word_comparison(gt_words, ocr_words)
-                error_stats   = calculate_error_statistics(comparison_df)
+            st.subheader("Ground Truth Preview")
+            st.text_area("PDF Text (normalized)", normalize_text(ground_truth)[:3000], height=200)
+            st.subheader("OCR Output Preview")
+            st.text_area("OCR Text (normalized)", normalize_text(ocr_text)[:3000],    height=200)
 
-            # ── Metric cards ──────────────────────────────────────────────────
-            st.markdown("---")
-            st.markdown("### 📊 Report 1 — OCR Accuracy Summary")
-
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("OCR Accuracy",      f"{accuracy:.2f}%")
-            m2.metric("Word Error Rate",   f"{error_rate * 100:.2f}%")
-            m3.metric("Ground Truth Words", f"{len(gt_words):,}")
-            m4.metric("OCR Words",          f"{len(ocr_words):,}")
-
-            e1, e2, e3, e4 = st.columns(4)
-            e1.metric("✅ Matches",       f"{error_stats['Matches']:,}")
-            e2.metric("🔄 Substitutions", f"{error_stats['Substitutions']:,}")
-            e3.metric("➕ Insertions",    f"{error_stats['Insertions']:,}")
-            e4.metric("➖ Deletions",     f"{error_stats['Deletions']:,}")
-
-            # Summary table (mirrors Sheet 1 of the Excel)
-            summary_data = {
-                "Metric": [
-                    "OCR Accuracy (%)",
-                    "Word Error Rate (%)",
-                    "Ground Truth Words",
-                    "OCR Words",
-                    "Total Matches",
-                    "Total Mismatches",
-                    "Substitutions",
-                    "Insertions",
-                    "Deletions",
-                ],
-                "Value": [
-                    round(accuracy, 2),
-                    round(error_rate * 100, 2),
-                    len(gt_words),
-                    len(ocr_words),
-                    error_stats["Matches"],
-                    error_stats["Substitutions"] + error_stats["Insertions"] + error_stats["Deletions"],
-                    error_stats["Substitutions"],
-                    error_stats["Insertions"],
-                    error_stats["Deletions"],
-                ],
-            }
-            st.dataframe(pd.DataFrame(summary_data), use_container_width=True, hide_index=True)
-
-            # ── Word comparison preview ───────────────────────────────────────
-            st.markdown("---")
-            st.markdown("### 📋 Report 2 — Word Comparison (Ground Truth vs OCR Output)")
-
-            # Colour-map for display
-            def highlight_status(row):
-                color_map = {
-                    "Match":        "background-color: #C6EFCE; color: #375623",
-                    "Substitution": "background-color: #FFC7CE; color: #9C0006",
-                    "Deletion":     "background-color: #FFEB9C; color: #7F6000",
-                    "Insertion":    "background-color: #FCE4D6; color: #843C0C",
-                }
-                style = color_map.get(row["Status"], "")
-                return [style, style, style]
-
-            preview_df = comparison_df.head(200).reset_index(drop=True)
-            st.dataframe(
-                preview_df.style.apply(highlight_status, axis=1),
-                use_container_width=True,
-                height=400,
-            )
-
-            if len(comparison_df) > 200:
-                st.info(
-                    f"Showing first 200 of **{len(comparison_df):,}** word comparisons. "
-                    "Full data is in the downloaded Excel file (all rows included)."
-                )
-
-            # ── Inline diff view ─────────────────────────────────────────────
-            st.markdown("---")
-            st.markdown("### 🔍 Inline Diff View")
-            diff_tokens = difflib.ndiff(gt_words[:500], ocr_words[:500])
+            st.subheader("Word Diff (colour highlight)")
+            gt_w  = normalize_text(ground_truth).split()
+            ocr_w = normalize_text(ocr_text).split()
             diff_html = ""
-            for token in diff_tokens:
+            for token in difflib.ndiff(gt_w, ocr_w):
                 if token.startswith("  "):
                     diff_html += f"{token[2:]} "
                 elif token.startswith("- "):
-                    diff_html += (
-                        f'<span style="background:#FFC7CE;border-radius:3px;'
-                        f'padding:1px 3px;margin:1px">{token[2:]}</span> '
-                    )
+                    diff_html += f'<span style="background:#ffcccc;">{token[2:]} </span>'
                 elif token.startswith("+ "):
-                    diff_html += (
-                        f'<span style="background:#C6EFCE;border-radius:3px;'
-                        f'padding:1px 3px;margin:1px">{token[2:]}</span> '
-                    )
-            st.markdown(
-                f'<div style="line-height:2;font-size:13px;font-family:monospace">{diff_html}</div>',
-                unsafe_allow_html=True,
-            )
+                    diff_html += f'<span style="background:#ccffcc;">{token[2:]} </span>'
+            st.markdown(diff_html, unsafe_allow_html=True)
 
-            # ── Download — Excel with 2 sheets ───────────────────────────────
-            st.markdown("---")
-            excel_bytes = create_excel_report(
-                ground_truth, ocr_text, accuracy, error_rate,
-                source_filename=original_pdf.name,
-            )
+            comp_df = generate_word_comparison(gt_w, ocr_w)
+            st.subheader("Word Comparison Table (first 100 rows)")
+            st.dataframe(comp_df.head(100).reset_index(drop=True), use_container_width=True)
+            if len(comp_df) > 100:
+                st.info(f"📊 Showing 100 of {len(comp_df)} rows — full data in Excel.")
 
-            st.success(
-                "✅ Excel report ready — **2 sheets inside**: "
-                "*Sheet 1 = OCR Accuracy Report* · *Sheet 2 = Word Comparison*"
-            )
+            st.subheader("Error Statistics")
+            err = calculate_error_statistics(comp_df)
+            e1, e2, e3, e4 = st.columns(4)
+            e1.metric("Matches",    err["Matches"])
+            e2.metric("Mismatches", err["Mismatches"])
+            e3.metric("Insertions", err["Insertions"])
+            e4.metric("Deletions",  err["Deletions"])
 
-            st.download_button(
-                label="📥 Download Excel Report (.xlsx) — 2 Sheets",
-                data=excel_bytes,
-                file_name="ocr_accuracy_report.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+            excel_data = create_professional_excel_report(ground_truth, ocr_text, accuracy, error_rate)
+            text_data  = create_text_report(ground_truth, ocr_text, accuracy, error_rate)
 
-            # Also offer plain text report (matches Abna's existing .txt format)
-            txt_report = (
-                f"OCR ACCURACY REPORT\n"
-                f"{'='*30}\n"
-                f"OCR Accuracy : {accuracy:.2f} %\n"
-                f"Word Error Rate : {error_rate * 100:.2f} %\n\n"
-                f"Ground Truth Words : {len(gt_words)}\n"
-                f"OCR Words : {len(ocr_words)}\n\n"
-                f"Matches       : {error_stats['Matches']}\n"
-                f"Substitutions : {error_stats['Substitutions']}\n"
-                f"Insertions    : {error_stats['Insertions']}\n"
-                f"Deletions     : {error_stats['Deletions']}\n"
-            )
-            st.download_button(
-                label="📄 Download Text Report (.txt)",
-                data=txt_report,
-                file_name="ocr_accuracy_report.txt",
-                mime="text/plain",
-            )
+            d1, d2 = st.columns(2)
+            with d1:
+                st.download_button(
+                    "📥 Download Excel Report (2 sheets)",
+                    data=excel_data,
+                    file_name="ocr_accuracy_report.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            with d2:
+                st.download_button(
+                    "📄 Download Text Report (.txt)",
+                    data=text_data,
+                    file_name="ocr_accuracy_report.txt",
+                    mime="text/plain",
+                )
 
-# ══════════════════════════════════════════════════════════════════
-# TAB 2 — NER Validator (QA-02)
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════
+# TAB 2 — HARINI : NER Validator (QA-02)
+# ══════════════════════════════════════════════════
 with tab2:
-    st.subheader("NER Entity Validator")
-    st.write("Upload entities.csv with columns: **word, label**")
+    st.subheader("NER Validation & Entity Highlighting Tool")
+    st.markdown("---")
 
-    ner_file = st.file_uploader("Upload entities.csv", type="csv", key="ner")
-    sample_text = st.text_area("Paste Sample Text to Highlight Entities", height=150)
+    ocr_txt_file  = st.file_uploader("Upload OCR Text File (.txt)",               type=["txt"],         key="ner_ocr")
+    auto_ner_file = st.file_uploader("Upload Automated Annotation (.xlsx or .csv)", type=["xlsx","csv"], key="auto_ner")
+    manual_file   = st.file_uploader("Upload Manual Annotation (.xlsx or .csv)",   type=["xlsx","csv"],  key="manual_ner")
 
-    colors = {
-        "HERB":      "#c8f7c5",
-        "DISEASE":   "#fad7d7",
-        "DOSHA":     "#ddd5f7",
-        "COMPOUND":  "#fef3c7",
-        "SYMPTOM":   "#ffe4b5",
-        "PROCEDURE": "#d0f0fd",
-    }
+    st.markdown("---")
 
-    if ner_file is not None and sample_text:
-        df = pd.read_csv(ner_file)
-        df["word"]  = df["word"].astype(str)
-        df["label"] = df["label"].str.upper()
-        st.success(f"Loaded {df.shape[0]} entities")
+    # ── Entity highlighting ────────────────────────────────────────────────────
+    if ocr_txt_file and auto_ner_file:
+        text = ocr_txt_file.read().decode("utf-8")
+        auto_df = pd.read_excel(auto_ner_file) if auto_ner_file.name.endswith(".xlsx") else pd.read_csv(auto_ner_file)
 
-        highlighted = sample_text
-        for _, row in df.iterrows():
-            word  = row["word"]
-            label = row["label"]
-            color = colors.get(label, "#e5e7eb")
-            highlighted = highlighted.replace(
-                word,
-                f'<mark style="background:{color};padding:2px 5px;'
-                f'border-radius:4px;font-weight:500" title="{label}">{word}</mark>',
-            )
+        st.markdown("""
+### Legend
+🟢 HERB &nbsp; 🔴 DISEASE &nbsp; 🟠 BODY_PART &nbsp; 🔵 PROCEDURE &nbsp;
+🟣 BIOLOGICAL_PROCESS &nbsp; 🟡 SYMPTOM &nbsp; 🟦 CHEMICAL &nbsp; ⚪ PROTEIN
+""")
+        if "Entity" in auto_df.columns and "Label" in auto_df.columns:
+            st.subheader("Highlighted Entities")
+            st.markdown(highlight_entities(text, auto_df), unsafe_allow_html=True)
+        else:
+            st.warning("Automated file must have columns: Entity, Label")
 
-        st.subheader("Highlighted Entities")
-        st.markdown(
-            f'<div style="line-height:2.2;font-size:14px">{highlighted}</div>',
-            unsafe_allow_html=True,
+    # ── Automated file preview ─────────────────────────────────────────────────
+    if auto_ner_file:
+        auto_df2 = pd.read_excel(auto_ner_file) if auto_ner_file.name.endswith(".xlsx") else pd.read_csv(auto_ner_file)
+        st.subheader("Automated Annotation Preview")
+        st.dataframe(auto_df2, use_container_width=True)
+
+    # ── Manual file preview ────────────────────────────────────────────────────
+    if manual_file:
+        manual_df = pd.read_excel(manual_file) if manual_file.name.endswith(".xlsx") else pd.read_csv(manual_file)
+        st.subheader("Manual Annotation Preview")
+        st.dataframe(manual_df, use_container_width=True)
+
+    # ── NER Validation metrics ─────────────────────────────────────────────────
+    if auto_ner_file and manual_file:
+        st.markdown("---")
+        st.header("NER Validation")
+
+        auto_df_v   = pd.read_excel(auto_ner_file)  if auto_ner_file.name.endswith(".xlsx")  else pd.read_csv(auto_ner_file)
+        manual_df_v = pd.read_excel(manual_file)    if manual_file.name.endswith(".xlsx")     else pd.read_csv(manual_file)
+
+        matched, missing, extra, precision, recall, f1 = compute_ner_metrics(auto_df_v, manual_df_v)
+
+        st.subheader("Validation Summary")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Matched", len(matched))
+        m2.metric("Missing", len(missing))
+        m3.metric("Extra",   len(extra))
+
+        chart_df = pd.DataFrame({
+            "Category": ["Matched", "Missing", "Extra"],
+            "Count":    [len(matched), len(missing), len(extra)]
+        })
+        st.subheader("Validation Overview")
+        st.bar_chart(chart_df.set_index("Category"))
+
+        st.subheader("Performance Metrics")
+        p1, p2, p3 = st.columns(3)
+        p1.metric("Precision", f"{precision*100:.2f}%")
+        p2.metric("Recall",    f"{recall*100:.2f}%")
+        p3.metric("F1 Score",  f"{f1*100:.2f}%")
+
+        if f1 >= 0.90:
+            st.success("✅ Excellent NER Performance")
+        elif f1 >= 0.80:
+            st.success("✅ Good NER Performance")
+        elif f1 >= 0.70:
+            st.warning("⚠️ Moderate NER Performance")
+        else:
+            st.error("❌ NER Performance Needs Improvement")
+
+        st.markdown("---")
+
+        # Download NER report CSV
+        report_df = pd.DataFrame({
+            "Metric": ["Matched", "Missing", "Extra", "Precision", "Recall", "F1 Score"],
+            "Value":  [len(matched), len(missing), len(extra),
+                       round(precision*100,2), round(recall*100,2), round(f1*100,2)]
+        })
+        st.download_button(
+            "📥 Download NER Report (.csv)",
+            data=report_df.to_csv(index=False),
+            file_name="ner_report.csv",
+            mime="text/csv",
         )
 
-        # Legend
-        st.markdown("---")
-        leg_cols = st.columns(len(colors))
-        for i, (lbl, col) in enumerate(colors.items()):
-            leg_cols[i].markdown(
-                f'<span style="background:{col};padding:3px 10px;'
-                f'border-radius:4px;font-size:12px">{lbl}</span>',
-                unsafe_allow_html=True,
-            )
-
-        st.subheader("Entity Breakdown")
-        entity_counts = df["label"].value_counts().reset_index()
-        entity_counts.columns = ["Entity Type", "Count"]
-        st.dataframe(entity_counts, use_container_width=True)
-
-        # F1 section
-        st.markdown("---")
-        st.subheader("F1 Score Validation")
-        st.write("Upload your manually labelled ground truth to calculate F1 score.")
-        gt_file = st.file_uploader("Upload ground_truth.csv (word, label)", type="csv", key="gt")
-
-        if gt_file:
-            from sklearn.metrics import classification_report
-            df_gt = pd.read_csv(gt_file)
-            df_gt["word"]  = df_gt["word"].str.lower().str.strip()
-            df_gt["label"] = df_gt["label"].str.upper().str.strip()
-            df["word"]     = df["word"].str.lower().str.strip()
-
-            merged = pd.merge(df_gt, df, on="word", suffixes=("_true", "_pred"))
-            if merged.empty:
-                st.warning("No matching words found between the two files.")
+        # Missing / Extra tables
+        col_m, col_e = st.columns(2)
+        with col_m:
+            st.subheader("Missing Entities")
+            if missing:
+                st.dataframe(pd.DataFrame(sorted(missing), columns=["Missing Entity"]), use_container_width=True)
             else:
-                report = classification_report(
-                    merged["label_true"], merged["label_pred"],
-                    output_dict=True, zero_division=0,
-                )
-                report_df = pd.DataFrame(report).T.round(2)
-                st.dataframe(report_df, use_container_width=True)
-                overall_f1 = report.get("weighted avg", {}).get("f1-score", 0)
-                st.metric("Overall F1 Score", f"{overall_f1:.2f}")
-                if overall_f1 >= 0.8:
-                    st.success("Good NER performance!")
-                elif overall_f1 >= 0.6:
-                    st.warning("Moderate — some improvement possible.")
-                else:
-                    st.error("Low performance — model may need retraining.")
+                st.success("No Missing Entities")
+        with col_e:
+            st.subheader("Extra Entities")
+            if extra:
+                st.dataframe(pd.DataFrame(sorted(extra), columns=["Extra Entity"]), use_container_width=True)
+            else:
+                st.success("No Extra Entities")
 
-                csv_bytes = report_df.to_csv().encode()
-                st.download_button(
-                    "📥 Download F1 Report (CSV)", csv_bytes,
-                    "ner_f1_report.csv", "text/csv",
-                )
-
-# ══════════════════════════════════════════════════════════════════
-# TAB 3 — Relationship Reviewer + Neo4j (QA-03 + DB-02)
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════
+# TAB 3 — NEHA : Relationship Reviewer (QA-03 + DB-02)
+# ══════════════════════════════════════════════════
 with tab3:
-    st.subheader("Relationship Reviewer + Neo4j Export")
-    st.write("Upload **relationships.csv** (columns: subject, relation, object)")
+    st.subheader("Relationship Validator & Neo4j Export")
+    st.write("Upload relationships.csv — columns: **Source, Relation, Target** (or subject, relation, object)")
 
-    rel_file = st.file_uploader("Upload relationships.csv", type="csv", key="rel")
+    rel_file = st.file_uploader("Upload relationships.csv", type=["csv"], key="rel")
 
     if rel_file:
-        if "rel_df" not in st.session_state or st.session_state.get("loaded_file") != rel_file.name:
-            df_rel = pd.read_csv(rel_file)
-            df_rel["validated"] = ""
-            st.session_state["rel_df"]      = df_rel
-            st.session_state["loaded_file"] = rel_file.name
+        df_raw = pd.read_csv(rel_file)
+        st.subheader("Raw Data Preview")
+        st.dataframe(df_raw, use_container_width=True)
 
-        df_rel  = st.session_state["rel_df"]
-        total   = len(df_rel)
-        reviewed = (df_rel["validated"] != "").sum()
+        # Auto-detect column names
+        cols = df_raw.columns.tolist()
+        col_map = {}
+        for c in cols:
+            cl = c.lower()
+            if cl in ("source", "subject"):
+                col_map["source"] = c
+            elif cl in ("relation", "relationship"):
+                col_map["relation"] = c
+            elif cl in ("target", "object"):
+                col_map["target"] = c
 
-        st.progress(int(reviewed) / total, text=f"Progress: {int(reviewed)} of {total} reviewed")
-
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Total",    total)
-        c2.metric("✅ Correct", int((df_rel["validated"] == "correct").sum()))
-        c3.metric("❌ Wrong",   int((df_rel["validated"] == "wrong").sum()))
-
-        st.markdown("---")
-        pending = df_rel[df_rel["validated"] == ""]
-
-        if not pending.empty:
-            idx = pending.index[0]
-            row = df_rel.loc[idx]
-
-            st.markdown("### Is this relationship correct?")
-            st.markdown(
-                f'<div style="background:var(--secondary-background-color);'
-                f'border-radius:12px;padding:20px;text-align:center;margin:10px 0">'
-                f'<span style="font-size:20px;font-weight:600">{row["subject"]}</span>'
-                f'<span style="font-size:14px;color:#888;margin:0 14px;font-style:italic">'
-                f'── {row["relation"]} ──▶</span>'
-                f'<span style="font-size:20px;font-weight:600">{row["object"]}</span>'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
-
-            b1, b2, b3 = st.columns([2, 2, 1])
-            if b1.button("✅  Correct", use_container_width=True):
-                st.session_state["rel_df"].at[idx, "validated"] = "correct"
-                st.rerun()
-            if b2.button("❌  Wrong", use_container_width=True):
-                st.session_state["rel_df"].at[idx, "validated"] = "wrong"
-                st.rerun()
-            if b3.button("⏭ Skip", use_container_width=True):
-                st.session_state["rel_df"].at[idx, "validated"] = "skip"
-                st.rerun()
+        if len(col_map) < 3:
+            st.error(f"CSV must have Source/subject, Relation, Target/object columns. Found: {cols}")
         else:
-            st.success("All relationships reviewed!")
+            src_col = col_map["source"]
+            rel_col = col_map["relation"]
+            tgt_col = col_map["target"]
 
-        st.markdown("---")
-        validated_df = df_rel[df_rel["validated"] == "correct"]
-        st.subheader(f"Validated Relationships ({len(validated_df)})")
-        if not validated_df.empty:
-            st.dataframe(
-                validated_df[["subject", "relation", "object"]],
-                use_container_width=True,
-            )
+            # ── Validation ────────────────────────────────────────────────────
+            df_validated = validate_relationships(df_raw)
 
-            # Cypher export
-            st.markdown("---")
-            st.subheader("Neo4j Cypher Export (DB-02)")
-            cypher_lines = [
-                "// MedYukthee AI — Validated Ayurveda Knowledge Graph",
-                "// Generated by QA Validation Tool", "",
-            ]
-            for _, r in validated_df.iterrows():
-                s   = str(r["subject"]).replace('"', "'").strip()
-                rel = str(r["relation"]).upper().replace(" ", "_").strip()
-                o   = str(r["object"]).replace('"', "'").strip()
-                cypher_lines.append(
-                    f'MERGE (a:Entity {{name:"{s}"}}) '
-                    f'MERGE (b:Entity {{name:"{o}"}}) '
-                    f'MERGE (a)-[:{rel}]->(b);'
-                )
-            cypher_text = "\n".join(cypher_lines)
-            st.code(cypher_text, language="cypher")
+            st.subheader("Validation Summary")
+            v1, v2, v3 = st.columns(3)
+            v1.metric("Total Rows (original)", len(df_raw))
+            v2.metric("Duplicates Removed",    int(df_raw.duplicated().sum()))
+            v3.metric("Valid Relationships",   len(df_validated))
 
-            st.download_button(
-                "📥 Download Neo4j Cypher File",
-                cypher_text,
-                "medyukthee_validated.cypher",
-                "text/plain",
-            )
+            st.subheader("Validated Relationships")
+            st.dataframe(df_validated, use_container_width=True)
+
             st.download_button(
                 "📥 Download Validated CSV",
-                validated_df.to_csv(index=False).encode(),
-                "validated_relationships.csv",
-                "text/csv",
+                data=df_validated.to_csv(index=False),
+                file_name="validated_relationships.csv",
+                mime="text/csv",
             )
 
-            # Graph schema reference
             st.markdown("---")
-            st.subheader("Neo4j Graph Schema (DB-02)")
-            st.markdown("""
-**Node Types:** `Herb` · `Disease` · `Dosha` · `Compound`
 
-**Relationship Types:**
-- `Herb` **TREATS** `Disease`
-- `Herb` **BALANCES** `Dosha`
-- `Herb` **CONTAINS** `Compound`
-- `Herb` **IMPROVES** Condition
-- `Herb` **PREVENTS** `Disease`
-            """)
-        else:
-            st.info("Validate some relationships above to enable export.")
+            # ── Graph Visualization (NEW) ─────────────────────────────────────
+            st.subheader("🕸️ Knowledge Graph Visualization")
+            st.caption("🟢 Green = Source node (Herb)   🔴 Red = Target node (Disease/Dosha)")
+
+            if PYVIS_AVAILABLE:
+                graph_html = draw_graph(df_validated, src_col, rel_col, tgt_col)
+                st.components.v1.html(graph_html, height=520, scrolling=False)
+            else:
+                st.warning("Install pyvis to see the graph:  pip install pyvis")
+
+            st.markdown("---")
+
+            # ── Push to Neo4j (NEW) ───────────────────────────────────────────
+            st.subheader("🚀 Push to Neo4j Desktop")
+
+            if not NEO4J_AVAILABLE:
+                st.error("neo4j library not installed. Run:  pip install neo4j")
+            else:
+                with st.expander("⚙️ Neo4j Connection Settings", expanded=True):
+                    neo_uri  = st.text_input("Neo4j URI",      value="bolt://localhost:7687")
+                    neo_user = st.text_input("Username",        value="neo4j")
+                    neo_pass = st.text_input("Password",        type="password", placeholder="Enter your Neo4j password")
+
+                if st.button("🚀 Push All Relationships to Neo4j"):
+                    if not neo_pass:
+                        st.warning("Please enter your Neo4j password above.")
+                    else:
+                        with st.spinner("Connecting to Neo4j and pushing data..."):
+                            try:
+                                count = push_to_neo4j(
+                                    df_validated, src_col, rel_col, tgt_col,
+                                    neo_uri, neo_user, neo_pass
+                                )
+                                st.success(f"✅ {count} relationships pushed to Neo4j!")
+                                st.info("👉 Open Neo4j Browser at http://localhost:7474 and run:  MATCH (n)-[r]->(m) RETURN n,r,m  to see your graph.")
+                            except Exception as e:
+                                st.error(f"❌ Could not connect to Neo4j: {e}")
+                                st.info("Make sure Neo4j Desktop is running and the password is correct.")
+
+            st.markdown("---")
+
+            # ── Cypher Export ─────────────────────────────────────────────────
+            st.subheader("📄 Neo4j Cypher Export")
+            cypher_text = build_cypher(df_validated, src_col, rel_col, tgt_col)
+            st.code(cypher_text[:3000], language="cypher")
+            if len(cypher_text) > 3000:
+                st.info("Preview shows first 3000 chars — full file in download.")
+
+            st.download_button(
+                "🔗 Download Neo4j Cypher File (.cypher)",
+                data=cypher_text,
+                file_name="validated_relationships.cypher",
+                mime="text/plain",
+            )
+            st.success("✅ Neo4j Cypher export ready!")
+
+            # ── Relationship schema overview ───────────────────────────────────
+            st.markdown("---")
+            st.subheader("📊 Relationship Schema Overview")
+            rel_counts = df_validated[rel_col].value_counts().reset_index()
+            rel_counts.columns = ["Relation Type", "Count"]
+            st.bar_chart(rel_counts.set_index("Relation Type"))
+            st.dataframe(rel_counts, use_container_width=True)

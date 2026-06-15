@@ -1,4 +1,4 @@
-# MedYukthee QA Validation Tool
+# QA Validation Tool
 
 A production-quality Streamlit application for **OCR accuracy validation**, **NER entity highlighting**, and **knowledge graph relationship extraction**.
 
@@ -177,8 +177,8 @@ streamlit run app.py
 
 ### Docker
 ```bash
-docker build -t medyukthee-qa .
-docker run -p 8501:8501 medyukthee-qa
+docker build -t qa-validation-tool .
+docker run -p 8501:8501 qa-validation-tool
 ```
 
 ### Streamlit Cloud (Free)
