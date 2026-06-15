@@ -310,11 +310,55 @@ def compute_ner_metrics(auto_df: pd.DataFrame, manual_df: pd.DataFrame):
 # NEHA — Relationship helpers (QA-03)
 # ==================================================
 
-def validate_relationships(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.drop_duplicates()
-    df = df.copy()
-    df["Status"] = "Correct"
+def validate_relationships(df: pd.DataFrame, src_col: str, rel_col: str, tgt_col: str) -> pd.DataFrame:
+    df = df.drop_duplicates().copy()
+    df["Status"] = "Supported"
+
+    # Count degrees for relationship pattern detection
+    src_counts = df.groupby([src_col, rel_col])[tgt_col].transform('nunique')
+    tgt_counts = df.groupby([tgt_col, rel_col])[src_col].transform('nunique')
+    total_tgts = df[tgt_col].nunique()
+
+    for idx, row in df.iterrows():
+        # Cartesian-product style: source connects to many/most targets
+        if src_counts.loc[idx] > 1 and src_counts.loc[idx] >= (total_tgts * 0.8):
+            df.at[idx, "Status"] = "Suspicious"
+        # Common-to-all pattern: high degree connectivity for a specific relation
+        elif src_counts.loc[idx] > 5 or tgt_counts.loc[idx] > 5:
+            df.at[idx, "Status"] = "Needs Review"
+
     return df
+
+def create_relationship_benchmark_report(df_validated: pd.DataFrame, file_name: str) -> bytes:
+    output = BytesIO()
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Relationship Benchmark"
+
+    BLUE_HDR = PatternFill("solid", fgColor="4472C4")
+    WHT_FONT = Font(bold=True, color="FFFFFF")
+
+    headers = ["Resource ID", "PDF Name", "Relationship Count", "Accuracy %", "Supported Count", "Needs Review Count", "Suspicious Count"]
+    for c, h in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=c, value=h)
+        cell.fill = BLUE_HDR
+        cell.font = WHT_FONT
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        ws.column_dimensions[openpyxl.utils.get_column_letter(c)].width = 20
+
+    rel_count = len(df_validated)
+    sup_count = (df_validated["Status"] == "Supported").sum()
+    rev_count = (df_validated["Status"] == "Needs Review").sum()
+    susp_count = (df_validated["Status"] == "Suspicious").sum()
+
+    accuracy = (sup_count / rel_count * 100) if rel_count > 0 else 0.0
+
+    row_data = ["RES-001", file_name, rel_count, round(accuracy, 2), sup_count, rev_count, susp_count]
+    for c, val in enumerate(row_data, 1):
+        ws.cell(row=2, column=c, value=val)
+
+    wb.save(output)
+    return output.getvalue()
 
 
 # ==================================================
@@ -376,7 +420,12 @@ def draw_graph(df: pd.DataFrame, src_col: str, rel_col: str, tgt_col: str) -> st
             },
             "interaction": {"hover": true, "navigationButtons": true, "tooltipDelay": 200},
             "physics": {
-                "forceAtlas2Based": {"gravitationalConstant": -200, "springLength": 180, "avoidOverlap": 1},
+                "forceAtlas2Based": {
+                    "gravitationalConstant": -150, 
+                    "springLength": 250, 
+                    "springConstant": 0.05, 
+                    "avoidOverlap": 1
+                },
                 "solver": "forceAtlas2Based",
                 "maxVelocity": 50
             }
@@ -683,13 +732,14 @@ with tab3:
             rel_col = col_map["relation"]
             tgt_col = col_map["target"]
 
-            df_validated = validate_relationships(df_raw)
+            df_validated = validate_relationships(df_raw, src_col, rel_col, tgt_col)
 
             st.subheader("Validation Summary")
-            v1, v2, v3 = st.columns(3)
+            v1, v2, v3, v4 = st.columns(4)
             v1.metric("Total Rows (original)", len(df_raw))
             v2.metric("Duplicates Removed",    int(df_raw.duplicated().sum()))
-            v3.metric("Valid Relationships",   len(df_validated))
+            v3.metric("Supported Relations",   len(df_validated[df_validated["Status"] == "Supported"]))
+            v4.metric("Suspicious/Review",     len(df_validated[df_validated["Status"].isin(["Suspicious", "Needs Review"])]))
 
             st.subheader("Validated Relationships")
             st.dataframe(df_validated, use_container_width=True)
@@ -703,7 +753,7 @@ with tab3:
 
             # ── Downloads ─────────────────────────────────────────────────────
             st.markdown("---")
-            d1, d2 = st.columns(2)
+            d1, d2, d3 = st.columns(3)
             with d1:
                 st.download_button(
                     "📥 Download Validated CSV",
@@ -717,7 +767,7 @@ with tab3:
                     "RELATIONSHIP VALIDATION REPORT", "=" * 40,
                     f"Total Rows (original) : {len(df_raw)}",
                     f"Duplicates Removed    : {int(df_raw.duplicated().sum())}",
-                    f"Valid Relationships   : {len(df_validated)}",
+                    f"Supported Relations   : {len(df_validated[df_validated['Status'] == 'Supported'])}",
                     "", "Relation Type Counts", "-" * 40,
                 ] + [f"{r['Relation Type']}: {r['Count']}" for _, r in rel_counts.iterrows()])
                 st.download_button(
@@ -725,6 +775,14 @@ with tab3:
                     data=val_report,
                     file_name="relationship_validation_report.txt",
                     mime="text/plain",
+                )
+            with d3:
+                excel_report = create_relationship_benchmark_report(df_validated, rel_file.name)
+                st.download_button(
+                    "📊 Download Benchmark Report (.xlsx)",
+                    data=excel_report,
+                    file_name="relationship_benchmark.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
 
             # Store validated data in session for Tab 4
