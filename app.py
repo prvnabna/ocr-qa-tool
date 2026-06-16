@@ -21,7 +21,7 @@ except ImportError:
     PYVIS_AVAILABLE = False
 
 # ==================================================
-# ABNA — Extraction helpers (QA-01)
+# ABNA — Extraction helpers (QA-01)   [UNCHANGED]
 # ==================================================
 
 def extract_pdf_text(pdf_file) -> str:
@@ -142,7 +142,6 @@ def create_professional_excel_report(ground_truth, ocr_text, accuracy, error_rat
             cell.font = WHT_FONT
             cell.alignment = Alignment(horizontal="center", vertical="center")
 
-    # Sheet 1 — Summary
     ws1 = wb.active
     ws1.title = "Summary"
     rows_data = [
@@ -163,7 +162,6 @@ def create_professional_excel_report(ground_truth, ocr_text, accuracy, error_rat
     ws1.column_dimensions["A"].width = 28
     ws1.column_dimensions["B"].width = 20
 
-    # Sheet 2 — Word Comparison
     ws2 = wb.create_sheet("Word Comparison")
     for c, h in enumerate(["Ground Truth", "OCR Output", "Status"], 1):
         ws2.cell(1, c, h)
@@ -210,7 +208,7 @@ def create_text_report(ground_truth, ocr_text, accuracy, error_rate) -> str:
 
 
 # ==================================================
-# HARINI — NER helpers (QA-02)
+# HARINI — NER helpers (QA-02)   [UNCHANGED]
 # ==================================================
 
 ENTITY_COLORS = {
@@ -228,12 +226,6 @@ ENTITY_COLORS = {
 
 
 def highlight_entities(text: str, entity_df: pd.DataFrame) -> str:
-    """
-    Highlight entities in text using span-based, non-overlapping replacement.
-    Finds all entity occurrences as character-level spans, sorts them, resolves
-    overlaps (longest match wins), then rebuilds the string — so no entity label
-    ever bleeds into surrounding text.
-    """
     if not text:
         return text
 
@@ -241,7 +233,6 @@ def highlight_entities(text: str, entity_df: pd.DataFrame) -> str:
     entity_df["Entity"] = entity_df["Entity"].astype(str)
     entity_df["Label"]  = entity_df["Label"].astype(str).str.upper()
 
-    # Build list of (start, end, entity_text, label, color)
     spans = []
     for _, row in entity_df.iterrows():
         entity = row["Entity"].strip()
@@ -249,7 +240,6 @@ def highlight_entities(text: str, entity_df: pd.DataFrame) -> str:
         color  = ENTITY_COLORS.get(label, "#ffff99")
         if not entity:
             continue
-        # Case-insensitive search for all occurrences
         pattern = re.compile(re.escape(entity), re.IGNORECASE)
         for m in pattern.finditer(text):
             spans.append((m.start(), m.end(), m.group(), label, color))
@@ -257,10 +247,8 @@ def highlight_entities(text: str, entity_df: pd.DataFrame) -> str:
     if not spans:
         return text
 
-    # Sort by start position; for ties prefer longer span (greedy)
     spans.sort(key=lambda s: (s[0], -(s[1] - s[0])))
 
-    # Remove overlapping spans — keep first (longest at each position)
     filtered = []
     last_end = -1
     for span in spans:
@@ -269,13 +257,10 @@ def highlight_entities(text: str, entity_df: pd.DataFrame) -> str:
             filtered.append(span)
             last_end = end
 
-    # Reconstruct the text with HTML highlights
     result = []
     cursor = 0
     for start, end, matched_text, label, color in filtered:
-        # Append plain text before this span
         result.append(text[cursor:start])
-        # Append highlighted span
         result.append(
             f"<span style='background-color:{color};"
             f"padding:2px 5px;border-radius:4px;font-weight:500;'>"
@@ -285,10 +270,7 @@ def highlight_entities(text: str, entity_df: pd.DataFrame) -> str:
         )
         cursor = end
 
-    # Append any remaining plain text
     result.append(text[cursor:])
-
-    # Preserve line breaks for readability
     highlighted = "".join(result)
     highlighted = highlighted.replace("\n", "<br>")
     return highlighted
@@ -307,173 +289,376 @@ def compute_ner_metrics(auto_df: pd.DataFrame, manual_df: pd.DataFrame):
 
 
 # ==================================================
-# NEHA — Relationship helpers (QA-03)
+# NEHA — Relationship helpers (QA-03)  [REPLACED]
 # ==================================================
 
-def validate_relationships(df: pd.DataFrame, src_col: str, rel_col: str, tgt_col: str) -> pd.DataFrame:
-    df = df.drop_duplicates().copy()
-    df["Status"] = "Supported"
+# Thresholds for quality checks
+_CARTESIAN_SOURCE_THRESHOLD = 5   # if unique sources * unique targets == total rows and both >= this → Cartesian
+_DOMINANT_REL_THRESHOLD     = 0.85  # if one relation type covers ≥85% of rows → common-to-all pattern
+_MIN_TOKEN_LEN              = 2     # endpoints shorter than this are suspicious
 
-    # Count degrees for relationship pattern detection
-    src_counts = df.groupby([src_col, rel_col])[tgt_col].transform('nunique')
-    tgt_counts = df.groupby([tgt_col, rel_col])[src_col].transform('nunique')
-    total_tgts = df[tgt_col].nunique()
 
-    for idx, row in df.iterrows():
-        # Cartesian-product style: source connects to many/most targets
-        if src_counts.loc[idx] > 1 and src_counts.loc[idx] >= (total_tgts * 0.8):
-            df.at[idx, "Status"] = "Suspicious"
-        # Common-to-all pattern: high degree connectivity for a specific relation
-        elif src_counts.loc[idx] > 5 or tgt_counts.loc[idx] > 5:
-            df.at[idx, "Status"] = "Needs Review"
+def _clean_str(val) -> str:
+    """Strip and lowercase a cell value for comparison."""
+    return str(val).strip().lower() if not pd.isna(val) else ""
 
+
+def validate_relationships(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Validate a relationships DataFrame and assign a Status column.
+
+    Status values (priority order — first match wins per row):
+      'Suspicious'   — duplicate triple, self-loop, blank endpoint,
+                       or part of a detected Cartesian-product dataset
+      'Needs Review' — endpoint token too short, OR relation belongs to a
+                       single dominant relation type that covers ≥85% of rows
+                       (common-to-all pattern)
+      'Supported'    — passes all checks
+
+    The function also annotates a 'Quality_Note' column with a short
+    human-readable reason for non-Supported rows.
+
+    Deduplication: duplicates are KEPT (marked Suspicious) so the user
+    can see exactly which rows were flagged and decide what to do.
+    """
+    if df.empty:
+        out = df.copy()
+        out["Status"]       = pd.Series(dtype=str)
+        out["Quality_Note"] = pd.Series(dtype=str)
+        return out
+
+    df = df.copy().reset_index(drop=True)
+
+    # ── Auto-detect the three key columns ─────────────────────────────────────
+    col_map: dict = {}
+    for c in df.columns:
+        cl = c.lower().strip()
+        if cl in ("source", "subject"):
+            col_map["source"] = c
+        elif cl in ("relation", "relationship"):
+            col_map["relation"] = c
+        elif cl in ("target", "object"):
+            col_map["target"] = c
+
+    if len(col_map) < 3:
+        df["Status"]       = "Needs Review"
+        df["Quality_Note"] = "Cannot detect Source/Relation/Target columns"
+        return df
+
+    src = col_map["source"]
+    rel = col_map["relation"]
+    tgt = col_map["target"]
+
+    # ── Dataset-level checks (computed once) ──────────────────────────────────
+
+    # 1. Dominant relation type (common-to-all pattern)
+    rel_counts     = df[rel].astype(str).str.strip().str.upper().value_counts(normalize=True)
+    top_rel_frac   = rel_counts.iloc[0] if not rel_counts.empty else 0.0
+    top_rel_name   = rel_counts.index[0] if not rel_counts.empty else ""
+    is_common_to_all = top_rel_frac >= _DOMINANT_REL_THRESHOLD
+
+    # 2. Cartesian-product detection
+    n_unique_src = df[src].astype(str).str.strip().nunique()
+    n_unique_tgt = df[tgt].astype(str).str.strip().nunique()
+    expected_cartesian = n_unique_src * n_unique_tgt
+    is_cartesian = (
+        expected_cartesian == len(df)
+        and n_unique_src >= _CARTESIAN_SOURCE_THRESHOLD
+        and n_unique_tgt >= _CARTESIAN_SOURCE_THRESHOLD
+    )
+
+    # ── Row-level masks ────────────────────────────────────────────────────────
+
+    # Blank / NaN endpoint or relation
+    blank_mask = df.apply(
+        lambda r: (
+            pd.isna(r[src]) or str(r[src]).strip() == "" or
+            pd.isna(r[rel]) or str(r[rel]).strip() == "" or
+            pd.isna(r[tgt]) or str(r[tgt]).strip() == ""
+        ),
+        axis=1,
+    )
+
+    # Self-loop
+    self_loop_mask = (
+        df[src].astype(str).str.strip().str.lower()
+        == df[tgt].astype(str).str.strip().str.lower()
+    )
+
+    # Duplicate triple (every occurrence after first)
+    dup_mask = df.duplicated(subset=[src, rel, tgt], keep="first")
+
+    # Short token
+    short_mask = (
+        (df[src].astype(str).str.strip().str.len() <= _MIN_TOKEN_LEN) |
+        (df[tgt].astype(str).str.strip().str.len() <= _MIN_TOKEN_LEN)
+    )
+
+    # ── Assign Status + Quality_Note per row ──────────────────────────────────
+    statuses = []
+    notes    = []
+
+    for i in df.index:
+        if blank_mask.at[i]:
+            statuses.append("Suspicious")
+            notes.append("Blank or missing field")
+        elif dup_mask.at[i]:
+            statuses.append("Suspicious")
+            notes.append("Duplicate triple")
+        elif self_loop_mask.at[i]:
+            statuses.append("Suspicious")
+            notes.append("Self-loop (source == target)")
+        elif is_cartesian:
+            statuses.append("Suspicious")
+            notes.append(f"Cartesian-product dataset detected ({n_unique_src} sources × {n_unique_tgt} targets)")
+        elif short_mask.at[i]:
+            statuses.append("Needs Review")
+            notes.append(f"Endpoint token ≤ {_MIN_TOKEN_LEN} characters")
+        elif is_common_to_all:
+            statuses.append("Needs Review")
+            notes.append(f"Dominant relation '{top_rel_name}' covers {top_rel_frac*100:.0f}% of rows")
+        else:
+            statuses.append("Supported")
+            notes.append("")
+
+    df["Status"]       = statuses
+    df["Quality_Note"] = notes
     return df
 
-def create_relationship_benchmark_report(df_validated: pd.DataFrame, file_name: str) -> bytes:
-    output = BytesIO()
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Relationship Benchmark"
 
+# ==================================================
+# NEHA — Relationship benchmark Excel (QA-03)
+# ==================================================
+
+def create_relationship_benchmark_excel(df_validated: pd.DataFrame,
+                                        src_col: str,
+                                        rel_col: str,
+                                        tgt_col: str) -> bytes:
+    """
+    Generate a benchmark Excel report for the validated relationships.
+
+    Sheet 1 — Per-Resource Summary
+        Resource ID | PDF Name | Relationship Count | Accuracy % | Supported | Needs Review | Suspicious
+
+    Sheet 2 — Full Validated Data (all rows + Status + Quality_Note)
+    """
+    output   = BytesIO()
+    wb       = openpyxl.Workbook()
     BLUE_HDR = PatternFill("solid", fgColor="4472C4")
     WHT_FONT = Font(bold=True, color="FFFFFF")
 
-    headers = ["Resource ID", "PDF Name", "Relationship Count", "Accuracy %", "Supported Count", "Needs Review Count", "Suspicious Count"]
-    for c, h in enumerate(headers, 1):
-        cell = ws.cell(row=1, column=c, value=h)
-        cell.fill = BLUE_HDR
-        cell.font = WHT_FONT
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-        ws.column_dimensions[openpyxl.utils.get_column_letter(c)].width = 20
+    def _hdr(ws, n):
+        for c in range(1, n + 1):
+            cell = ws.cell(1, c)
+            cell.fill = BLUE_HDR
+            cell.font = WHT_FONT
+            cell.alignment = Alignment(horizontal="center", vertical="center")
 
-    rel_count = len(df_validated)
-    sup_count = (df_validated["Status"] == "Supported").sum()
-    rev_count = (df_validated["Status"] == "Needs Review").sum()
-    susp_count = (df_validated["Status"] == "Suspicious").sum()
+    # ── Sheet 1: Per-Resource Summary ─────────────────────────────────────────
+    ws1 = wb.active
+    ws1.title = "Per-Resource Summary"
 
-    accuracy = (sup_count / rel_count * 100) if rel_count > 0 else 0.0
+    hdrs1 = [
+        "Resource ID", "PDF Name",
+        "Relationship Count", "Accuracy %",
+        "Supported", "Needs Review", "Suspicious",
+    ]
+    for c, h in enumerate(hdrs1, 1):
+        ws1.cell(1, c, h)
+    _hdr(ws1, len(hdrs1))
 
-    row_data = ["RES-001", file_name, rel_count, round(accuracy, 2), sup_count, rev_count, susp_count]
-    for c, val in enumerate(row_data, 1):
-        ws.cell(row=2, column=c, value=val)
+    STATUS_FILL = {
+        "Supported":    PatternFill("solid", fgColor="C6EFCE"),
+        "Needs Review": PatternFill("solid", fgColor="FFEB9C"),
+        "Suspicious":   PatternFill("solid", fgColor="FFC7CE"),
+    }
+
+    # Group by source entity so each unique source is a "resource"
+    sources = df_validated[src_col].astype(str).str.strip().unique()
+    row_idx = 2
+    for res_id, source in enumerate(sorted(sources), 1):
+        sub = df_validated[df_validated[src_col].astype(str).str.strip() == source]
+        total      = len(sub)
+        n_supp     = int((sub["Status"] == "Supported").sum())
+        n_review   = int((sub["Status"] == "Needs Review").sum())
+        n_susp     = int((sub["Status"] == "Suspicious").sum())
+        accuracy   = round(n_supp / total * 100, 2) if total > 0 else 0.0
+
+        vals = [res_id, source, total, accuracy, n_supp, n_review, n_susp]
+        for c, v in enumerate(vals, 1):
+            ws1.cell(row_idx, c, v)
+
+        # Colour the Accuracy cell
+        acc_cell = ws1.cell(row_idx, 4)
+        if accuracy >= 80:
+            acc_cell.fill = PatternFill("solid", fgColor="C6EFCE")
+        elif accuracy >= 50:
+            acc_cell.fill = PatternFill("solid", fgColor="FFEB9C")
+        else:
+            acc_cell.fill = PatternFill("solid", fgColor="FFC7CE")
+
+        row_idx += 1
+
+    for i, w in enumerate([12, 30, 20, 14, 14, 14, 14], 1):
+        ws1.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
+
+    # ── Sheet 2: Full Validated Data ──────────────────────────────────────────
+    ws2 = wb.create_sheet("Validated Relationships")
+    export_cols = list(df_validated.columns)
+    for c, h in enumerate(export_cols, 1):
+        ws2.cell(1, c, h)
+    _hdr(ws2, len(export_cols))
+
+    for r_i, (_, row) in enumerate(df_validated.iterrows(), 2):
+        for c_i, col_name in enumerate(export_cols, 1):
+            ws2.cell(r_i, c_i, row[col_name])
+        status = row.get("Status", "")
+        fill   = STATUS_FILL.get(status)
+        if fill:
+            for c_i in range(1, len(export_cols) + 1):
+                ws2.cell(r_i, c_i).fill = fill
+
+    for i in range(1, len(export_cols) + 1):
+        ws2.column_dimensions[openpyxl.utils.get_column_letter(i)].width = 28
 
     wb.save(output)
     return output.getvalue()
 
 
 # ==================================================
-# NEHA — Neo4j helpers (DB-02)
+# NEHA — Neo4j helpers (DB-02)   [FIXED Cypher escape + improved graph]
 # ==================================================
 
 def build_cypher(df: pd.DataFrame, source_col: str, relation_col: str, target_col: str) -> str:
     def _cypher_escape(s: object) -> str:
-        """Escape a Python string for safe inclusion in a Cypher double-quoted literal.
-
-        Replaces embedded double quotes with an escaped form (\") and
-        normalizes newlines/whitespace so node names remain single-line.
-        """
+        """Escape value for safe use inside a Cypher double-quoted string literal."""
         if s is None:
             return ""
         stxt = str(s)
-        # Normalize whitespace and remove newlines
         stxt = re.sub(r"[\r\n]+", " ", stxt).strip()
-        # Escape double quotes for safe inclusion in a double-quoted Cypher string
-        return stxt.replace('"', '\\"')
+        stxt = stxt.replace("\\", "\\\\")   # backslash first
+        stxt = stxt.replace('"', '\\"')     # then double-quote
+        return stxt
 
-    header = [
-           "// Validated Knowledge Graph",
-           "// Generated by QA Validation Tool",
-        ""
+    lines = [
+        "// Validated Knowledge Graph",
+        "// Generated by QA Validation Tool",
+        "",
     ]
-
-    lines = header[:]
     for _, row in df.iterrows():
-        src = _cypher_escape(row[source_col])
-        # Build a safe relation label: uppercase, spaces -> underscores,
-        # and replace any non-alphanumeric/underscore with underscore.
+        src     = _cypher_escape(row[source_col])
         rel_raw = "" if row[relation_col] is None else str(row[relation_col])
-        rel = re.sub(r"[^A-Z0-9_]", "_", rel_raw.upper().replace(" ", "_"))
-        tgt = _cypher_escape(row[target_col])
+        rel     = re.sub(r"[^A-Z0-9_]", "_", rel_raw.upper().replace(" ", "_"))
+        tgt     = _cypher_escape(row[target_col])
 
         lines.append(f'MERGE (a:Entity {{name:"{src}"}})')
         lines.append(f'MERGE (b:Entity {{name:"{tgt}"}})')
-        lines.append(f"MERGE (a)-[:{rel}]->(b);")
+        lines.append(f'MERGE (a)-[:{rel}]->(b);')
+        lines.append("")
 
-    return "\n\n".join(lines)
+    return "\n".join(lines)
 
 
 def draw_graph(df: pd.DataFrame, src_col: str, rel_col: str, tgt_col: str) -> str:
-        # Improved visualization: white background, navigation, hover tooltips,
-        # and node sizing based on degree for readability.
-        net = Network(height="650px", width="100%", bgcolor="#ffffff", font_color="#111111", directed=True)
-        net.set_options("""
-        {
-            "nodes": {
-                "font": {"size": 16, "color": "#111111"},
-                "borderWidth": 2,
-                "shadow": {"enabled": true}
-            },
-            "edges": {
-                "font": {"size": 12, "color": "#555555"},
-                "arrows": {"to": {"enabled": true, "scaleFactor": 0.8}},
-                "smooth": {"type": "dynamic"}
-            },
-            "interaction": {"hover": true, "navigationButtons": true, "tooltipDelay": 200},
-            "physics": {
-                "forceAtlas2Based": {
-                    "gravitationalConstant": -150, 
-                    "springLength": 250, 
-                    "springConstant": 0.05, 
-                    "avoidOverlap": 1
-                },
-                "solver": "forceAtlas2Based",
-                "maxVelocity": 50
-            }
-        }
-        """)
+    """
+    Render an interactive PyVis knowledge graph.
+    - White background
+    - Degree-based node sizing
+    - Hover tooltips showing node name + connection count
+    - Navigation buttons
+    - ForceAtlas2 layout for better spacing
+    """
+    net = Network(
+        height="680px",
+        width="100%",
+        bgcolor="#ffffff",
+        font_color="#111111",
+        directed=True,
+    )
+    net.set_options("""
+    {
+      "nodes": {
+        "font": {"size": 15, "color": "#111111", "face": "Arial"},
+        "borderWidth": 2,
+        "borderWidthSelected": 4,
+        "shadow": {"enabled": true, "color": "rgba(0,0,0,0.15)", "size": 8, "x": 2, "y": 2}
+      },
+      "edges": {
+        "font": {"size": 11, "color": "#555555", "align": "middle"},
+        "arrows": {"to": {"enabled": true, "scaleFactor": 0.7}},
+        "smooth": {"type": "curvedCW", "roundness": 0.2},
+        "color": {"color": "#aaaaaa", "highlight": "#e74c3c", "hover": "#3498db"}
+      },
+      "interaction": {
+        "hover": true,
+        "navigationButtons": true,
+        "tooltipDelay": 150,
+        "hideEdgesOnDrag": true
+      },
+      "physics": {
+        "solver": "forceAtlas2Based",
+        "forceAtlas2Based": {
+          "gravitationalConstant": -180,
+          "centralGravity": 0.01,
+          "springLength": 200,
+          "springConstant": 0.05,
+          "damping": 0.4,
+          "avoidOverlap": 0.8
+        },
+        "maxVelocity": 40,
+        "minVelocity": 0.5,
+        "stabilization": {"iterations": 200}
+      }
+    }
+    """)
 
-        from collections import Counter
+    from collections import Counter
 
-        # Compute node degrees for sizing
-        degree = Counter()
-        rows = df.to_dict(orient="records")
-        for row in rows:
-                s = str(row[src_col]).strip()
-                t = str(row[tgt_col]).strip()
-                degree[s] += 1
-                degree[t] += 1
+    rows = df.to_dict(orient="records")
 
-        node_colors = {}
-        added_nodes = set()
-        for row in rows:
-                src = str(row[src_col]).strip()
-                rel = str(row[rel_col]).strip().upper()
-                tgt = str(row[tgt_col]).strip()
+    # Compute degree for sizing
+    degree: Counter = Counter()
+    for row in rows:
+        s = str(row[src_col]).strip()
+        t = str(row[tgt_col]).strip()
+        degree[s] += 1
+        degree[t] += 1
 
-                if src not in node_colors:
-                        node_colors[src] = "#4CAF50"
-                if tgt not in node_colors:
-                        node_colors[tgt] = "#F44336"
+    # Palette: source nodes green, target nodes coral
+    SRC_COLOR = {"background": "#4CAF50", "border": "#2e7d32", "highlight": {"background": "#66BB6A", "border": "#1b5e20"}}
+    TGT_COLOR = {"background": "#EF5350", "border": "#b71c1c", "highlight": {"background": "#EF9A9A", "border": "#b71c1c"}}
 
-                for node, color in ((src, node_colors[src]), (tgt, node_colors[tgt])):
-                        if node not in added_nodes:
-                                sz = max(14, min(60, 12 + degree[node] * 6))
-                                title = f"{node}\nConnections: {degree[node]}"
-                                net.add_node(node, label=node, title=title, color=color, size=sz)
-                                added_nodes.add(node)
+    added_nodes: set = set()
+    src_nodes:   set = set()
+    for row in rows:
+        src_nodes.add(str(row[src_col]).strip())
 
-                net.add_edge(src, tgt, label=rel, title=rel, color="#888888")
+    for row in rows:
+        s   = str(row[src_col]).strip()
+        r   = str(row[rel_col]).strip().upper()
+        t   = str(row[tgt_col]).strip()
 
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".html")
-        net.save_graph(tmp.name)
-        with open(tmp.name, "r", encoding="utf-8") as f:
-                html = f.read()
-        os.unlink(tmp.name)
-        return html
+        for node in (s, t):
+            if node not in added_nodes:
+                deg  = degree[node]
+                size = max(16, min(65, 14 + deg * 7))
+                tip  = f"{node}\nRelationships: {deg}"
+                color = SRC_COLOR if node in src_nodes else TGT_COLOR
+                net.add_node(node, label=node, title=tip, color=color, size=size, mass=max(1, deg * 0.5))
+                added_nodes.add(node)
+
+        net.add_edge(s, t, label=r, title=r, color={"color": "#aaaaaa", "highlight": "#e74c3c"})
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".html")
+    net.save_graph(tmp.name)
+    with open(tmp.name, "r", encoding="utf-8") as f:
+        html = f.read()
+    os.unlink(tmp.name)
+    return html
 
 
 # ==================================================
-# Streamlit UI — 4 tabs
+# Streamlit UI — 4 tabs (unchanged tab count)
 # ==================================================
 
 st.set_page_config(page_title="QA Validation Tool", layout="wide")
@@ -487,7 +672,7 @@ tab1, tab2, tab3, tab4 = st.tabs([
 ])
 
 # ══════════════════════════════════════════════════
-# TAB 1 — ABNA : OCR Accuracy (QA-01)
+# TAB 1 — ABNA : OCR Accuracy (QA-01)   [UNCHANGED]
 # ══════════════════════════════════════════════════
 with tab1:
     st.subheader("OCR Accuracy Validation")
@@ -569,7 +754,7 @@ with tab1:
                 )
 
 # ══════════════════════════════════════════════════
-# TAB 2 — HARINI : NER Validator (QA-02)
+# TAB 2 — HARINI : NER Validator (QA-02)   [UNCHANGED]
 # ══════════════════════════════════════════════════
 with tab2:
     st.subheader("NER Validation & Entity Highlighting Tool")
@@ -585,7 +770,6 @@ with tab2:
         text    = ocr_txt_file.read().decode("utf-8")
         auto_df = pd.read_excel(auto_ner_file) if auto_ner_file.name.endswith(".xlsx") else pd.read_csv(auto_ner_file)
 
-        # Legend with color swatches
         st.markdown("### Legend")
         legend_cols = st.columns(len(ENTITY_COLORS))
         for col, (label, color) in zip(legend_cols, ENTITY_COLORS.items()):
@@ -598,7 +782,6 @@ with tab2:
         if "Entity" in auto_df.columns and "Label" in auto_df.columns:
             st.subheader("Highlighted Entities")
             highlighted_html = highlight_entities(text, auto_df)
-            # Wrap in a styled container for clean rendering
             st.markdown(
                 f"""
                 <div style="
@@ -696,7 +879,7 @@ with tab2:
                 st.success("No Extra Entities")
 
 # ══════════════════════════════════════════════════
-# TAB 3 — NEHA : Relationship Reviewer (QA-03)
+# TAB 3 — NEHA : Relationship Reviewer (QA-03)  [REPLACED]
 # ══════════════════════════════════════════════════
 with tab3:
     st.subheader("Relationship Validator (QA-03)")
@@ -717,7 +900,7 @@ with tab3:
         cols    = df_raw.columns.tolist()
         col_map = {}
         for c in cols:
-            cl = c.lower()
+            cl = c.lower().strip()
             if cl in ("source", "subject"):
                 col_map["source"] = c
             elif cl in ("relation", "relationship"):
@@ -732,68 +915,104 @@ with tab3:
             rel_col = col_map["relation"]
             tgt_col = col_map["target"]
 
-            df_validated = validate_relationships(df_raw, src_col, rel_col, tgt_col)
+            # ── Run validation ─────────────────────────────────────────────────
+            df_validated = validate_relationships(df_raw)
 
+            n_total    = len(df_raw)
+            n_dups     = int(df_raw.duplicated(subset=[src_col, rel_col, tgt_col]).sum())
+            n_supp     = int((df_validated["Status"] == "Supported").sum())
+            n_review   = int((df_validated["Status"] == "Needs Review").sum())
+            n_susp     = int((df_validated["Status"] == "Suspicious").sum())
+
+            # ── Summary metrics ────────────────────────────────────────────────
             st.subheader("Validation Summary")
-            v1, v2, v3, v4 = st.columns(4)
-            v1.metric("Total Rows (original)", len(df_raw))
-            v2.metric("Duplicates Removed",    int(df_raw.duplicated().sum()))
-            v3.metric("Supported Relations",   len(df_validated[df_validated["Status"] == "Supported"]))
-            v4.metric("Suspicious/Review",     len(df_validated[df_validated["Status"].isin(["Suspicious", "Needs Review"])]))
+            v1, v2, v3, v4, v5 = st.columns(5)
+            v1.metric("Total Rows",       n_total)
+            v2.metric("Duplicates Found", n_dups)
+            v3.metric("✅ Supported",      n_supp)
+            v4.metric("⚠️ Needs Review",  n_review)
+            v5.metric("🚨 Suspicious",    n_susp)
 
+            # ── Quality check info boxes ───────────────────────────────────────
+            with st.expander("ℹ️ What do the status labels mean?"):
+                st.markdown("""
+| Status | Meaning |
+|---|---|
+| **Supported** | Passes all checks — clean, unique, non-trivial triple |
+| **Needs Review** | Short endpoint token, or dominant single relation type detected across the whole dataset (common-to-all pattern) |
+| **Suspicious** | Duplicate triple, self-loop (source == target), blank field, or Cartesian-product dataset detected |
+""")
+                st.markdown(f"""
+**Dataset-level checks applied:**
+- **Cartesian-product detection** — flags the entire dataset if `unique_sources × unique_targets == total_rows` and both counts ≥ {_CARTESIAN_SOURCE_THRESHOLD}
+- **Common-to-all relation** — flags rows when one relation type covers ≥ {int(_DOMINANT_REL_THRESHOLD*100)}% of all rows
+""")
+
+            # ── Colour-coded table ─────────────────────────────────────────────
             st.subheader("Validated Relationships")
-            st.dataframe(df_validated, use_container_width=True)
 
-            # ── Relationship type breakdown ────────────────────────────────────
-            st.subheader("Relationship Type Breakdown")
-            rel_counts = df_validated[rel_col].value_counts().reset_index()
-            rel_counts.columns = ["Relation Type", "Count"]
-            st.bar_chart(rel_counts.set_index("Relation Type"))
-            st.dataframe(rel_counts, use_container_width=True)
+            STATUS_BG = {
+                "Supported":    "background-color: #C6EFCE; color: #1a5c1a",
+                "Needs Review": "background-color: #FFEB9C; color: #7a5c00",
+                "Suspicious":   "background-color: #FFC7CE; color: #8b0000",
+            }
+
+            def _style_status(row):
+                style = STATUS_BG.get(row.get("Status", ""), "")
+                return [style] * len(row)
+
+            st.dataframe(
+                df_validated.style.apply(_style_status, axis=1),
+                use_container_width=True,
+            )
+
+            # ── Relationship type breakdown (Supported rows only) ──────────────
+            df_supported = df_validated[df_validated["Status"] == "Supported"]
+            if not df_supported.empty:
+                st.subheader("Relationship Type Breakdown (Supported rows only)")
+                rel_counts = df_supported[rel_col].value_counts().reset_index()
+                rel_counts.columns = ["Relation Type", "Count"]
+                st.bar_chart(rel_counts.set_index("Relation Type"))
+                st.dataframe(rel_counts, use_container_width=True)
 
             # ── Downloads ─────────────────────────────────────────────────────
             st.markdown("---")
             d1, d2, d3 = st.columns(3)
+
             with d1:
                 st.download_button(
-                    "📥 Download Validated CSV",
+                    "📥 Download Full Validated CSV",
                     data=df_validated.to_csv(index=False),
-                    file_name="validated_relationships.csv",
+                    file_name="validated_relationships_full.csv",
                     mime="text/csv",
                 )
             with d2:
-                # Validation report
-                val_report = "\n".join([
-                    "RELATIONSHIP VALIDATION REPORT", "=" * 40,
-                    f"Total Rows (original) : {len(df_raw)}",
-                    f"Duplicates Removed    : {int(df_raw.duplicated().sum())}",
-                    f"Supported Relations   : {len(df_validated[df_validated['Status'] == 'Supported'])}",
-                    "", "Relation Type Counts", "-" * 40,
-                ] + [f"{r['Relation Type']}: {r['Count']}" for _, r in rel_counts.iterrows()])
                 st.download_button(
-                    "📄 Download Validation Report (.txt)",
-                    data=val_report,
-                    file_name="relationship_validation_report.txt",
-                    mime="text/plain",
+                    "✅ Download Supported Rows Only (.csv)",
+                    data=df_supported.to_csv(index=False),
+                    file_name="validated_relationships_supported.csv",
+                    mime="text/csv",
                 )
             with d3:
-                excel_report = create_relationship_benchmark_report(df_validated, rel_file.name)
+                bench_excel = create_relationship_benchmark_excel(
+                    df_validated, src_col, rel_col, tgt_col
+                )
                 st.download_button(
                     "📊 Download Benchmark Report (.xlsx)",
-                    data=excel_report,
-                    file_name="relationship_benchmark.xlsx",
+                    data=bench_excel,
+                    file_name="relationship_benchmark_report.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
 
-            # Store validated data in session for Tab 4
-            st.session_state["validated_df"]  = df_validated
-            st.session_state["src_col"]       = src_col
-            st.session_state["rel_col"]       = rel_col
-            st.session_state["tgt_col"]       = tgt_col
-            st.success("✅ Data saved — go to Tab 4 (Neo4j Export) to visualise and export.")
+            # ── Pass Supported data to Tab 4 ──────────────────────────────────
+            st.session_state["validated_df"] = df_supported
+            st.session_state["src_col"]      = src_col
+            st.session_state["rel_col"]      = rel_col
+            st.session_state["tgt_col"]      = tgt_col
+            st.success("✅ Supported relationships saved — go to Tab 4 (Neo4j Export) to visualise and export.")
 
 # ══════════════════════════════════════════════════
-# TAB 4 — NEHA : Neo4j Export (DB-02)
+# TAB 4 — NEHA : Neo4j Export (DB-02)   [REPLACED]
 # ══════════════════════════════════════════════════
 with tab4:
     st.subheader("Neo4j Graph Export (DB-02)")
@@ -804,11 +1023,11 @@ with tab4:
 
     # Load from session OR allow direct upload
     if "validated_df" in st.session_state:
-        df_neo   = st.session_state["validated_df"]
-        src_col  = st.session_state["src_col"]
-        rel_col  = st.session_state["rel_col"]
-        tgt_col  = st.session_state["tgt_col"]
-        st.success(f"✅ Using {len(df_neo)} validated relationships from Tab 3.")
+        df_neo  = st.session_state["validated_df"]
+        src_col = st.session_state["src_col"]
+        rel_col = st.session_state["rel_col"]
+        tgt_col = st.session_state["tgt_col"]
+        st.success(f"✅ Using {len(df_neo)} supported relationships from Tab 3.")
     else:
         st.info("No data from Tab 3 yet. You can also upload directly here.")
         neo_file = st.file_uploader("Upload validated_relationships.csv", type=["csv"], key="neo_upload")
@@ -817,10 +1036,10 @@ with tab4:
             cols    = df_neo.columns.tolist()
             col_map = {}
             for c in cols:
-                cl = c.lower()
-                if cl in ("source", "subject"):   col_map["source"]   = c
+                cl = c.lower().strip()
+                if cl in ("source", "subject"):          col_map["source"]   = c
                 elif cl in ("relation", "relationship"): col_map["relation"] = c
-                elif cl in ("target", "object"):  col_map["target"]   = c
+                elif cl in ("target", "object"):         col_map["target"]   = c
             if len(col_map) < 3:
                 st.error(f"Could not detect columns. Found: {cols}")
                 st.stop()
@@ -855,11 +1074,11 @@ with tab4:
     # ── Knowledge Graph Visualization ─────────────────────────────────────────
     st.markdown("---")
     st.subheader("🕸️ Knowledge Graph Visualization")
-    st.caption("🟢 Green = Source node (Herb)   🔴 Red = Target node (Disease/Dosha)")
+    st.caption("🟢 Green = Source node   🔴 Red = Target node   — node size reflects number of relationships")
 
     if PYVIS_AVAILABLE:
         graph_html = draw_graph(df_neo, src_col, rel_col, tgt_col)
-        st.components.v1.html(graph_html, height=520, scrolling=False)
+        st.components.v1.html(graph_html, height=700, scrolling=False)
     else:
         st.warning("Install pyvis for graph visualization:  pip install pyvis")
 
@@ -872,11 +1091,11 @@ with tab4:
     )
 
     cypher_text = build_cypher(df_neo, src_col, rel_col, tgt_col)
-    # Display the full Cypher script so users can copy the entire content
+
     st.text_area(
         "Full Cypher Script",
         value=cypher_text,
-        height=400,
+        height=420,
     )
 
     st.download_button(
